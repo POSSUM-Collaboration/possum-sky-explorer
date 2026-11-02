@@ -1,0 +1,2684 @@
+<script>
+"use strict";
+/* ==================================================================
+   UI + orchestration
+   ================================================================== */
+const $ = id => document.getElementById(id);
+const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
+function fmt(v, dec){
+  if(v === null || v === undefined || !isFinite(v)) return "–";
+  const a = Math.abs(v);
+  if(a !== 0 && (a >= 1e5 || a < 1e-3)) return v.toExponential(2);
+  return v.toFixed(dec !== undefined ? dec : (a >= 100 ? 0 : a >= 10 ? 1 : a >= 1 ? 2 : 3));
+}
+function debounce(fn, ms){
+  let t = null;
+  return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
+}
+
+/* ---------- generic dual-range slider ------------------------------ */
+function dualSlider(container, opts){
+  // opts: {label, min, max, log, lo, hi, dec, onChange, single}
+  const log = !!opts.log;
+  const toS = v => log ? Math.log10(Math.max(v, 1e-12)) : v;
+  const frS = s => log ? Math.pow(10, s) : s;
+  const smin = toS(opts.min), smax = toS(opts.max);
+  container.classList.add("dsl");
+  container.innerHTML = `
+    <div class="lab"><span>${opts.label}</span><span class="val"></span></div>
+    <div class="track"><div class="rail"></div><div class="fill"></div>
+      <input type="range" class="rA" min="0" max="1000" step="1">
+      ${opts.single ? "" : '<input type="range" class="rB" min="0" max="1000" step="1">'}
+    </div>`;
+  const rA = container.querySelector(".rA"), rB = container.querySelector(".rB");
+  const fill = container.querySelector(".fill"), val = container.querySelector(".val");
+  const state = {lo: opts.lo ?? opts.min, hi: opts.hi ?? opts.max};
+  function pos2v(p){ return frS(smin + (smax - smin)*p/1000); }
+  function v2pos(v){ return Math.round((toS(v) - smin)/(smax - smin)*1000); }
+  function paint(){
+    const pa = v2pos(state.lo), pb = opts.single ? 1000 : v2pos(state.hi);
+    rA.value = pa; if(rB) rB.value = pb;
+    fill.style.left = (opts.single ? 0 : pa/10) + "%";
+    fill.style.width = (opts.single ? pa/10 : (pb - pa)/10) + "%";
+    val.textContent = opts.single ? fmt(state.lo, opts.dec)
+        : fmt(state.lo, opts.dec) + " – " + fmt(state.hi, opts.dec);
+  }
+  function emit(){ if(opts.onChange) opts.onChange(state.lo, state.hi); }
+  rA.addEventListener("input", () => {
+    let v = pos2v(+rA.value);
+    if(!opts.single && v > state.hi) v = state.hi;
+    state.lo = v; paint(); emit();
+  });
+  if(rB) rB.addEventListener("input", () => {
+    let v = pos2v(+rB.value);
+    if(v < state.lo) v = state.lo;
+    state.hi = v; paint(); emit();
+  });
+  paint();
+  return {
+    get: () => [state.lo, state.hi],
+    set: (lo, hi, silent) => { state.lo = lo; if(hi !== undefined) state.hi = hi; paint(); if(!silent) emit(); },
+  };
+}
+
+/* ---------- progress ----------------------------------------------- */
+let progressDepth = 0;
+function showProgress(text){
+  progressDepth++;
+  $("progresstext").textContent = text;
+  $("progressbar").style.width = "3%";
+  $("progress").style.display = "block";
+}
+function setProgress(frac){ $("progressbar").style.width = (frac*100).toFixed(1) + "%"; }
+function hideProgress(){
+  progressDepth = Math.max(0, progressDepth - 1);
+  if(progressDepth === 0) $("progress").style.display = "none";
+}
+
+/* ---------- tessellation pipeline ---------------------------------- */
+let medianNN = 0.05;
+let tessToken = 0;
+
+async function pipelineFilterChanged(){
+  filterGen++;
+  const token = ++tessToken;
+  applyFilters();
+  uploadBubbleIndex();
+  const denom = VIEW.dataset === "both" ? DATA.n : DATA.nP;
+  $("filtercount").textContent = DATA.filterCount.toLocaleString() + " / " + denom.toLocaleString();
+  $("pill-n").innerHTML = "<b>" + DATA.filterCount.toLocaleString() + "</b> components";
+  $("catcounts").textContent = DATA.filterCountP.toLocaleString() + " / " +
+      (VIEW.dataset === "both" ? DATA.filterCountS.toLocaleString() : "off");
+  if(REGION.active && REGION.idx){         // region membership derives from the filter
+    setRegionMembers(regionMembers());
+    if(activeTab === "region") renderRegionTab();
+  }
+  requestRender();
+  if(DATA.filterCount < 3){ return; }
+  if(VIEW.dataset === "blink"){ await pipelineBlink(token); return; }
+  stopBlink();
+  showProgress("Building spatial index…");
+  try{
+    const sub = await workerCall({type:"subset", idx: DATA.filteredIdx.slice()});
+    if(token !== tessToken){ return; }
+    medianNN = sub.medianNN;
+    await tessGlobal(token);
+  } finally { hideProgress(); }
+  scheduleRefine();
+}
+async function workerTessFull(){
+  const W = +VIEW.tessres, H = W/2;
+  return workerCall({type:"tess", W, H, lon0:0, lon1:360, lat0:-90, lat1:90,
+                     maxSep:VIEW.maxsep}, [], setProgress);
+}
+async function tessGlobal(token){
+  showProgress("Tessellating sky (" + DATA.filterCount.toLocaleString() + " components)…");
+  try{
+    const r = await workerTessFull();
+    if(token !== tessToken) return;
+    globalIdxMap = r.idxMap;
+    refineIdxMap = null; refineBoxJS = null;
+    bakeValueTexture(globalIdxMap, r.W, r.H, "global");
+    requestRender();
+  } finally { hideProgress(); }
+}
+
+/* ---------- blink comparator ------------------------------------------ */
+const BLINK = {mapA:null, mapB:null, valA:null, valB:null, catA:null, catB:null,
+               idxA:null, idxB:null, W:0, H:0, phase:0, timer:null, period:900,
+               paused:false, quantity:null};
+async function pipelineBlink(token){
+  stopBlink();
+  const A = [], B = [];
+  for(const i of DATA.filteredIdx) (DATA.cat[i] ? B : A).push(i);
+  BLINK.idxA = Uint32Array.from(A);
+  BLINK.idxB = Uint32Array.from(B);
+  if(A.length < 3 || B.length < 3) return;
+  showProgress("Blink: tessellating POSSUM (" + A.length.toLocaleString() + ")…");
+  try{
+    let sub = await workerCall({type:"subset", idx: BLINK.idxA.slice()});
+    if(token !== tessToken) return;
+    medianNN = sub.medianNN;
+    let r = await workerTessFull();
+    if(token !== tessToken) return;
+    BLINK.mapA = r.idxMap; BLINK.W = r.W; BLINK.H = r.H;
+    $("progresstext").textContent = "Blink: tessellating SPICE-RACS (" + B.length.toLocaleString() + ")…";
+    sub = await workerCall({type:"subset", idx: BLINK.idxB.slice()});
+    if(token !== tessToken) return;
+    r = await workerTessFull();
+    if(token !== tessToken) return;
+    BLINK.mapB = r.idxMap;
+    refineIdxMap = null; refineBoxJS = null;
+    bakeBlinkArrays();
+    startBlink();
+  } finally { hideProgress(); }
+}
+function bakeBlinkArrays(){
+  const vals = getValues(VIEW.quantity);
+  const N = BLINK.W*BLINK.H;
+  BLINK.valA = new Float32Array(N); BLINK.valB = new Float32Array(N);
+  for(let i=0;i<N;i++){
+    const a = BLINK.mapA[i], b = BLINK.mapB[i];
+    BLINK.valA[i] = a === 0xFFFFFFFF ? -1e30 : vals[a];
+    BLINK.valB[i] = b === 0xFFFFFFFF ? -1e30 : vals[b];
+  }
+  BLINK.catA = new Uint8Array(N);
+  BLINK.catB = new Uint8Array(N); BLINK.catB.fill(255);
+  BLINK.quantity = VIEW.quantity;
+}
+function blinkApplyPhase(){
+  const p = BLINK.phase;
+  globalIdxMap = p ? BLINK.mapB : BLINK.mapA;
+  uploadBakedGlobal(BLINK.W, BLINK.H, p ? BLINK.valB : BLINK.valA, p ? BLINK.catB : BLINK.catA);
+  uploadBubbleIndexFrom(p ? BLINK.idxB : BLINK.idxA);
+  const lb = $("blinklabel");
+  lb.style.display = "block";
+  lb.textContent = p ? "SPICE-RACS" : "POSSUM";
+  lb.style.color = p ? "#ff8fcf" : "#7ab8ff";
+  requestRender();
+}
+function startBlink(){
+  if(BLINK.timer) clearInterval(BLINK.timer);
+  BLINK.phase = 0;
+  blinkApplyPhase();
+  BLINK.timer = setInterval(() => {
+    if(!BLINK.paused){ BLINK.phase ^= 1; blinkApplyPhase(); }
+  }, BLINK.period);
+}
+function stopBlink(){
+  if(BLINK.timer){ clearInterval(BLINK.timer); BLINK.timer = null; }
+  const lb = $("blinklabel");
+  if(lb) lb.style.display = "none";
+}
+
+/* visible-region refinement */
+const scheduleRefine = debounce(async () => {
+  if(!VIEW.autorefine || !globalIdxMap) return;
+  if(VIEW.dataset === "blink") return;      // dual maps at base resolution only
+  if(VIEW.zoom < 1.35){       // full-sky texture is already adequate
+    if(refineBoxJS){ refineBoxJS = null; refineIdxMap = null; requestRender(); }
+    return;
+  }
+  const box = visibleGalacticBox();
+  if(!box) return;
+  const token = tessToken;
+  const quantity = VIEW.quantity, fg = filterGen;
+  // resolution: aim ~1.3 samples per screen pixel, cap texture at 2048^2
+  const w = canvas.clientWidth;
+  const degPerPx = (VIEW.proj === "globe")
+      ? R2D/globeScale() : 360/(4*Math.SQRT2*mollScale()/Math.PI); // approx at centre
+  let W = Math.round(clamp(box.dlon/(degPerPx/1.4), 256, 2048));
+  let H = Math.round(clamp(box.dlat/(degPerPx/1.4), 256, 2048));
+  const r = await workerCall({type:"tess", W, H,
+      lon0: box.lon0, lon1: box.lon0 + box.dlon,
+      lat0: box.lat0, lat1: box.lat0 + box.dlat, maxSep: VIEW.maxsep});
+  if(token !== tessToken || fg !== filterGen) return;
+  refineIdxMap = r.idxMap;
+  refineBoxJS = {lon0: box.lon0, lon1: box.lon0 + box.dlon, lat0: box.lat0,
+                 lat1: box.lat0 + box.dlat, W, H, quantity: VIEW.quantity, filterGen: fg};
+  bakeValueTexture(refineIdxMap, W, H, "refine");
+  refineBoxJS.quantity = VIEW.quantity;
+  requestRender();
+}, 420);
+
+function visibleGalacticBox(){
+  // sample the screen, collect galactic coords, box around view centre
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  let c0 = unproject(w/2, h/2);
+  if(!c0) return null;
+  let minD = 0, maxD = 0, minB = 90, maxB = -90;
+  let any = false;
+  for(let iy = 0; iy <= 10; iy++) for(let ix = 0; ix <= 10; ix++){
+    const p = unproject(ix*w/10, iy*h/10);
+    if(!p) continue;
+    any = true;
+    let d = (p[0] - c0[0] + 540) % 360 - 180;
+    if(d < minD) minD = d;
+    if(d > maxD) maxD = d;
+    if(p[1] < minB) minB = p[1];
+    if(p[1] > maxB) maxB = p[1];
+  }
+  if(!any) return null;
+  const mar = 4;
+  let lon0 = c0[0] + minD - mar, dlon = (maxD - minD) + 2*mar;
+  if(dlon >= 356){ lon0 = 0; dlon = 360; }
+  let lat0 = clamp(minB - mar, -90, 90);
+  let lat1 = clamp(maxB + mar, -90, 90);
+  return {lon0: ((lon0 % 360) + 360) % 360, dlon, lat0, dlat: lat1 - lat0};
+}
+
+/* ---------- colour scale / colourbar -------------------------------- */
+let vrangeSlider = null;
+function stretchFn(){
+  const {vmin, vmax, linthresh, stretch} = VIEW;
+  const lt = Math.max(linthresh, 1e-12);
+  if(stretch === "log"){
+    const l0 = Math.log(Math.max(vmin, 1e-30)), l1 = Math.log(Math.max(vmax, 1e-29));
+    return v => v <= 0 ? 0 : clamp((Math.log(v) - l0)/(l1 - l0), 0, 1);
+  }
+  if(stretch === "symlog"){
+    const s = v => Math.sign(v)*Math.log(1 + Math.abs(v)/lt);
+    const s0 = s(vmin), s1 = s(vmax);
+    return v => clamp((s(v) - s0)/(s1 - s0), 0, 1);
+  }
+  if(stretch === "asinh"){
+    const s = v => Math.asinh(v/lt);
+    const s0 = s(vmin), s1 = s(vmax);
+    return v => clamp((s(v) - s0)/(s1 - s0), 0, 1);
+  }
+  if(stretch === "sqrt") return v => Math.sqrt(clamp((v - vmin)/(vmax - vmin), 0, 1));
+  return v => clamp((v - vmin)/(vmax - vmin), 0, 1);   // linear & histeq (bar shows linear)
+}
+function niceTicks(vmin, vmax, log){
+  if(log){
+    const t = [];
+    const e0 = Math.ceil(Math.log10(Math.max(vmin, 1e-30))), e1 = Math.floor(Math.log10(vmax));
+    for(let e = e0; e <= e1; e++) t.push(Math.pow(10, e));
+    if(t.length < 2){
+      for(const m of [2, 5]) for(let e = e0 - 1; e <= e1 + 1; e++){
+        const v = m*Math.pow(10, e);
+        if(v > vmin && v < vmax) t.push(v);
+      }
+      t.sort((a, b) => a - b);
+    }
+    return t;
+  }
+  const span = vmax - vmin;
+  const step0 = Math.pow(10, Math.floor(Math.log10(span/5)));
+  let step = step0;
+  for(const m of [1, 2, 2.5, 5, 10]){ if(span/(step0*m) <= 6){ step = step0*m; break; } }
+  const t = [];
+  for(let v = Math.ceil(vmin/step)*step; v <= vmax + 1e-9*span; v += step) t.push(Math.abs(v) < step*1e-6 ? 0 : v);
+  return t;
+}
+function drawColorbar(ctx2, x, y, wpx, hpx, fontpx){
+  const lut = LUTS[VIEW.cmap] || LUTS.viridis;
+  const f = stretchFn();
+  const img = ctx2.createImageData(wpx, 1);
+  for(let i = 0; i < wpx; i++){
+    let t = i/(wpx - 1);
+    // invert the stretch numerically to draw value-space bar? simpler: bar in t-space, ticks placed by f(v)
+    let tt = VIEW.cmapFlip ? 1 - t : t;
+    const c = lut[Math.round(tt*255)];
+    img.data[4*i] = c[0]; img.data[4*i + 1] = c[1]; img.data[4*i + 2] = c[2]; img.data[4*i + 3] = 255;
+  }
+  // draw the 1-px strip scaled up
+  const off = document.createElement("canvas");
+  off.width = wpx; off.height = 1;
+  off.getContext("2d").putImageData(img, 0, 0);
+  ctx2.imageSmoothingEnabled = false;
+  ctx2.drawImage(off, x, y, wpx, hpx*0.5);
+  ctx2.imageSmoothingEnabled = true;
+  ctx2.strokeStyle = VIEW.theme === "light" ? "#333" : "#ccd2de";
+  ctx2.lineWidth = 1;
+  ctx2.strokeRect(x + 0.5, y + 0.5, wpx - 1, hpx*0.5 - 1);
+  // ticks
+  const log = VIEW.stretch === "log";
+  const ticks = niceTicks(VIEW.vmin, VIEW.vmax, log);
+  if(VIEW.stretch === "symlog" || VIEW.stretch === "asinh"){
+    ticks.length = 0;
+    let d = Math.max(VIEW.linthresh, 1e-12);
+    const lim = Math.max(Math.abs(VIEW.vmin), Math.abs(VIEW.vmax));
+    const ds = [];
+    while(d <= lim*1.0001){ ds.push(d); d *= 10; }
+    for(let i = ds.length - 1; i >= 0; i--) if(-ds[i] >= VIEW.vmin) ticks.push(-ds[i]);
+    if(VIEW.vmin < 0 && VIEW.vmax > 0) ticks.push(0);
+    for(const q of ds) if(q <= VIEW.vmax) ticks.push(q);
+  }
+  ctx2.fillStyle = VIEW.theme === "light" ? "#222" : "#dfe4ee";
+  ctx2.font = fontpx + "px ui-monospace, Menlo, monospace";
+  ctx2.textAlign = "center";
+  ctx2.textBaseline = "top";
+  const f2 = stretchFn();
+  for(const v of ticks){
+    const t = f2(v);
+    if(t < -0.001 || t > 1.001) continue;
+    const tx = x + t*(wpx - 1);
+    ctx2.strokeStyle = ctx2.fillStyle;
+    ctx2.beginPath();
+    ctx2.moveTo(tx, y + hpx*0.5 - 1);
+    ctx2.lineTo(tx, y + hpx*0.5 + 3);
+    ctx2.stroke();
+    const a = Math.abs(v);
+    const txt = (a !== 0 && (a >= 1e5 || a < 0.01)) ? v.toExponential(0).replace("+", "") : (+v.toFixed(4)).toString();
+    ctx2.fillText(txt, tx, y + hpx*0.5 + 4);
+  }
+}
+function updateColorbar(){
+  const cb = $("cbar");
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const W = 460, H = 42;
+  cb.width = W*dpr; cb.height = H*dpr;
+  cb.style.width = W + "px"; cb.style.height = H + "px";
+  const ctx2 = cb.getContext("2d");
+  ctx2.scale(dpr, dpr);
+  ctx2.clearRect(0, 0, W, H);
+  drawColorbar(ctx2, 10, 4, W - 20, 40, 10);
+  const q = QUANTITIES[VIEW.quantity];
+  $("cbartitle").textContent = q.label + (q.unit ? "  /  " + q.unit : "");
+  $("cbartitle").style.color = THEMES[VIEW.theme].ink;
+}
+function applyHisteq(){
+  if(VIEW.stretch === "histeq"){
+    const vals = getValues(VIEW.quantity);
+    uploadRemap(cdfRemap(vals, DATA.filteredIdx, VIEW.vmin, VIEW.vmax, 1024));
+  } else uploadRemapIdentity();
+}
+
+function setVRange(lo, hi, fromSlider){
+  VIEW.vmin = lo; VIEW.vmax = hi;
+  $("vmin").value = +lo.toPrecision(5);
+  $("vmax").value = +hi.toPrecision(5);
+  if(!fromSlider && vrangeSlider) vrangeSlider.set(lo, hi, true);
+  applyHisteq();
+  updateColorbar();
+  requestRender();
+  saveHash();
+}
+function rebuildVRangeSlider(){
+  const q = QUANTITIES[VIEW.quantity];
+  const vals = getValues(VIEW.quantity);
+  const idx = DATA.filteredIdx || (() => { const a = new Uint32Array(DATA.n); for(let i = 0; i < DATA.n; i++) a[i] = i; return a; })();
+  const [p0, p100] = percentilesOf(vals, idx, [0.02, 99.98]);
+  let lo = p0, hi = p100;
+  const log = VIEW.stretch === "log";
+  if(q.diverging){ const m = Math.max(Math.abs(lo), Math.abs(hi)); lo = -m; hi = m; }
+  if(log) lo = Math.max(lo, hi*1e-6);
+  const el = $("vrange-slider");
+  el.innerHTML = "";
+  vrangeSlider = dualSlider(el, {
+    label: "Colour range", min: lo, max: hi, log,
+    lo: clamp(VIEW.vmin, lo, hi), hi: clamp(VIEW.vmax, lo, hi),
+    dec: q.dec, onChange: debounce((a, b) => setVRange(a, b, true), 60),
+  });
+}
+
+/* ---------- quantity / presets -------------------------------------- */
+function defaultRangeFor(q){
+  const Q = QUANTITIES[q];
+  if(Q.vlim) return Q.vlim.slice();
+  const vals = getValues(q);
+  let idx = DATA.filteredIdx;
+  if(!idx){ idx = new Uint32Array(DATA.n); for(let i = 0; i < DATA.n; i++) idx[i] = i; }
+  const pct = Q.pct || [1, 99];
+  return percentilesOf(vals, idx, pct);
+}
+function setQuantity(q, keepScale){
+  VIEW.quantity = q;
+  $("quantity").value = q;
+  const Q = QUANTITIES[q];
+  if(!keepScale){
+    VIEW.cmap = Q.cmap; VIEW.cmapFlip = false;
+    VIEW.stretch = Q.stretch;
+    const [lo, hi] = defaultRangeFor(q);
+    VIEW.vmin = lo; VIEW.vmax = hi;
+    $("cmap").value = Q.cmap; $("stretch").value = Q.stretch;
+  }
+  $("linthreshrow").style.display = (VIEW.stretch === "symlog" || VIEW.stretch === "asinh") ? "flex" : "none";
+  uploadLUT();
+  rebuildVRangeSlider();
+  setVRange(VIEW.vmin, VIEW.vmax);
+  rebakeAll();
+  requestRender();
+}
+const PRESETS = {
+  rm:      () => { setQuantity("rm", false); VIEW.mapmode === "bubble" || setMapMode("tess"); },
+  polint:  () => { setQuantity("polint", false); },
+  fracpol: () => { setQuantity("fracpol", false); },
+  polang:  () => { setQuantity("polang", false); },
+};
+function setMapMode(m){
+  VIEW.mapmode = m;
+  $("mapmode").value = m;
+  $("bubbleopts").style.display = (m === "bubble" || m === "both") ? "block" : "none";
+  requestRender(); saveHash();
+}
+
+/* ---------- source filters UI --------------------------------------- */
+const filterSliders = [];
+function buildFilterUI(){
+  const host = $("filtersliders");
+  host.innerHTML = "";
+  const run = debounce(() => pipelineFilterChanged(), 350);
+  FILTER_DEFS.forEach((f, i) => {
+    const el = document.createElement("div");
+    host.appendChild(el);
+    filterSliders[i] = dualSlider(el, {
+      label: f.label, min: f.lo, max: f.hi, log: f.log, dec: 2,
+      lo: filterState[i].lo, hi: filterState[i].hi,
+      onChange: (lo, hi) => { filterState[i].lo = lo; filterState[i].hi = hi; run(); },
+    });
+  });
+  $("filterreset").onclick = () => {
+    FILTER_DEFS.forEach((f, i) => {
+      filterState[i].lo = f.lo; filterState[i].hi = f.hi;
+      filterSliders[i].set(f.lo, f.hi, true);
+    });
+    pipelineFilterChanged();
+  };
+}
+
+/* ---------- overlays -------------------------------------------------- */
+const OVERLAY_STYLE = {
+  famous:     {color:[1.0, 0.85, 0.45], ptSize:3.6, labels:true,  maxLabels:60, order:0},
+  clusters:   {color:[0.55, 0.95, 0.75], ptSize:2.4, labels:true, maxLabels:24, order:1},
+  erass1:     {color:[1.0, 0.62, 0.32], ptSize:2.4, labels:true,  maxLabels:20, order:1.5},
+  ktgroups:   {color:[0.65, 0.75, 1.0], ptSize:2.4, labels:true,  maxLabels:18, order:2},
+  ktgalaxies: {color:[0.85, 0.65, 1.0], ptSize:2.8, labels:true,  maxLabels:14, order:3},
+  ngc:        {color:[0.45, 0.85, 1.0], ptSize:2.8, labels:true,  maxLabels:14, order:4},
+  pulsars:    {color:[1.0, 0.55, 0.85], ptSize:3.2, labels:true,  maxLabels:14, order:5},
+};
+const IMPORT_COLORS = [[1, .75, .35], [.5, 1, .6], [1, .5, .5], [.6, .8, 1], [1, 1, .5]];
+let importCount = 0;
+const overlayState = {};   // key -> {enabled, showLabels, filters:{field:[lo,hi]}}
+
+function overlayRowsFiltered(key){
+  const ov = DATA.overlays[key];
+  const st = overlayState[key];
+  const fs = ov.filters || [];
+  if(!fs.length || !st) return ov.rows;
+  const idxs = fs.map(f => ov.fields.indexOf(f.field));
+  return ov.rows.filter(r => {
+    for(let k = 0; k < fs.length; k++){
+      const f = fs[k];
+      let v = r[idxs[k]];
+      if(v === null || v === undefined){ if(st.filters[f.field]) return false; else continue; }
+      if(f.absval) v = Math.abs(v);
+      const range = st.filters[f.field];
+      if(range && (v < range[0] || v > range[1])) return false;
+    }
+    return true;
+  });
+}
+function refreshOverlay(key){
+  const ov = DATA.overlays[key];
+  const st = overlayState[key];
+  const style = OVERLAY_STYLE[key] || st.style;
+  const rows = st.enabled ? overlayRowsFiltered(key) : [];
+  const spec = Object.assign({}, ov);
+  if(ov.kind === "circles"){
+    spec.radiusField = ov.fields.includes("th500") ? "th500" : "th2t";
+    spec.radius2Factor = ov.fields.includes("th500") ? 1.36 : null;   // ~Rvir from R500
+  }
+  const og = buildOverlayGeometry(key, rows, spec);
+  og.enabled = st.enabled;
+  og.color = style.color;
+  og.ptSize = ov.kind === "circles" ? 2.2 : style.ptSize;
+  og.alpha = 0.92;
+  og.showLabels = st.showLabels;
+  og.maxLabels = style.maxLabels;
+  og.labelColor = "rgb(" + style.color.map(c => Math.round(40 + c*215)).join(",") + ")";
+  // labels + hover index
+  const iN = ov.fields.indexOf("name"), iL = ov.fields.indexOf("l"), iB = ov.fields.indexOf("b");
+  const sorted = key === "clusters" ? rows.slice().sort((a, b) => b[ov.fields.indexOf("th500")] - a[ov.fields.indexOf("th500")])
+    : key === "ngc" ? rows.slice().sort((a, b) => a[ov.fields.indexOf("mag")] - b[ov.fields.indexOf("mag")])
+    : rows;
+  og.labels = sorted.slice(0, 400).map(r => ({
+    l: r[iL], b: r[iB],
+    html: r[iN] + (key === "famous" ? "" : ""),
+    dim: key !== "famous",
+  }));
+  og.hoverRows = rows;
+  og.hoverFields = ov.fields;
+  og.hoverVecs = new Float32Array(rows.length*3);
+  for(let i = 0; i < rows.length; i++){
+    const v = uvec(rows[i][iL], rows[i][iB]);
+    og.hoverVecs[3*i] = v[0]; og.hoverVecs[3*i + 1] = v[1]; og.hoverVecs[3*i + 2] = v[2];
+  }
+  const cnt = document.querySelector(`[data-ovcount="${key}"]`);
+  if(cnt) cnt.textContent = st.enabled ? rows.length.toLocaleString() : (ov.rows.length.toLocaleString());
+  requestRender();
+}
+function buildOverlayUI(){
+  const host = $("overlaylist");
+  host.innerHTML = "";
+  const keys = Object.keys(DATA.overlays).sort((a, b) =>
+    ((OVERLAY_STYLE[a] || {}).order ?? 9) - ((OVERLAY_STYLE[b] || {}).order ?? 9));
+  for(const key of keys) addOverlayCard(key, host);
+}
+function addOverlayCard(key, host){
+  const ov = DATA.overlays[key];
+  const style = OVERLAY_STYLE[key] || (overlayState[key] && overlayState[key].style);
+  if(!overlayState[key]){
+    overlayState[key] = {enabled: key === "famous", showLabels: true, filters: {}, style};
+  }
+  const st = overlayState[key];
+  const card = document.createElement("div");
+  card.className = "ov";
+  const rgb = "rgb(" + style.color.map(c => Math.round(c*255)).join(",") + ")";
+  card.innerHTML = `
+    <div class="ov-head">
+      <input type="checkbox" ${st.enabled ? "checked" : ""}>
+      <span class="sw" style="background:${rgb}"></span>
+      <span class="name">${ov.label}</span>
+      <span class="n" data-ovcount="${key}">${ov.rows.length.toLocaleString()}</span>
+    </div>
+    <div class="ov-body">
+      <div class="desc">${ov.desc || ""}</div>
+      <label class="check"><input type="checkbox" class="lbl" ${st.showLabels ? "checked" : ""}> Labels</label>
+      <div class="ovfilters"></div>
+    </div>`;
+  host = host || $("overlaylist");
+  host.appendChild(card);
+  const head = card.querySelector(".ov-head");
+  const cb = head.querySelector("input");
+  head.addEventListener("click", e => {
+    if(e.target === cb) return;
+    card.classList.toggle("open");
+  });
+  cb.addEventListener("change", () => {
+    st.enabled = cb.checked;
+    if(cb.checked) card.classList.add("open");
+    refreshOverlay(key);
+  });
+  card.querySelector(".lbl").addEventListener("change", e => {
+    st.showLabels = e.target.checked;
+    refreshOverlay(key);
+  });
+  const fhost = card.querySelector(".ovfilters");
+  const run = debounce(() => refreshOverlay(key), 250);
+  (ov.filters || []).forEach(f => {
+    const el = document.createElement("div");
+    fhost.appendChild(el);
+    dualSlider(el, {
+      label: f.label, min: Math.max(f.min, f.log ? Math.max(f.min, 1e-3) : f.min), max: f.max,
+      log: !!f.log, dec: 2,
+      onChange: (lo, hi) => { st.filters[f.field] = [lo, hi]; run(); },
+    });
+  });
+}
+
+/* ---------- hover / inspect ----------------------------------------- */
+function overlayHitTest(l, b, pxTol){
+  const v = uvec(l, b);
+  const scale = VIEW.proj === "globe" ? globeScale() : mollScale()*1.9;
+  const tolChord = pxTol/scale;
+  const tol2 = tolChord*tolChord;
+  let best = null, bd = tol2;
+  for(const key of Object.keys(overlayGL)){
+    const og = overlayGL[key];
+    if(!og.enabled || !og.hoverVecs) continue;
+    const hv = og.hoverVecs;
+    for(let i = 0; i < og.hoverRows.length; i++){
+      const dx = hv[3*i] - v[0], dy = hv[3*i + 1] - v[1], dz = hv[3*i + 2] - v[2];
+      const d = dx*dx + dy*dy + dz*dz;
+      if(d < bd){ bd = d; best = {key, i}; }
+    }
+  }
+  if(!best) return null;
+  const og = overlayGL[best.key];
+  return {key: best.key, row: og.hoverRows[best.i], fields: og.hoverFields,
+          label: DATA.overlays[best.key].label};
+}
+function valueAtPixel(l, b){
+  // read from refine map if inside, else global map (JS copies)
+  if(refineIdxMap && refineBoxJS && refineBoxJS.filterGen === filterGen){
+    const rb = refineBoxJS;
+    const rl = ((l - rb.lon0) % 360 + 360) % 360;
+    const rw = ((rb.lon1 - rb.lon0) % 360 + 360) % 360 || 360;
+    if(rl <= rw && b >= rb.lat0 && b <= rb.lat1){
+      const x = Math.min(rb.W - 1, Math.floor(rl/rw*rb.W));
+      const y = Math.min(rb.H - 1, Math.floor((b - rb.lat0)/(rb.lat1 - rb.lat0)*rb.H));
+      return refineIdxMap[y*rb.W + x];
+    }
+  }
+  if(!globalIdxMap) return 0xFFFFFFFF;
+  const W = valW, H = valH;
+  const x = Math.min(W - 1, Math.floor(((l % 360) + 360) % 360/360*W));
+  const y = Math.min(H - 1, Math.floor((b + 90)/180*H));
+  return globalIdxMap[y*W + x];
+}
+function updateStatus(mx, my){
+  const p = unproject(mx, my);
+  const stc = $("st-coord"), stv = $("st-val"), sts = $("st-src");
+  if(!p){ stc.textContent = ""; stv.textContent = ""; sts.textContent = ""; hideTip(); return; }
+  const [l, b] = p;
+  const [ra, dec] = galToEq(l, b);
+  stc.innerHTML = `l=<b>${l.toFixed(2)}°</b> b=<b>${b.toFixed(2)}°</b> &nbsp; α=<b>${ra.toFixed(2)}°</b> δ=<b>${dec.toFixed(2)}°</b>`;
+  const src = valueAtPixel(l, b);
+  if(src !== 0xFFFFFFFF && (VIEW.mapmode === "tess" || VIEW.mapmode === "both")){
+    const q = QUANTITIES[VIEW.quantity];
+    const v = getValues(VIEW.quantity)[src];
+    stv.innerHTML = `${q.label}=<b>${fmt(v, q.dec)}</b> ${q.unit}`;
+    sts.innerHTML = `cell: <b>${catId(src)}</b>`;
+  } else { stv.textContent = ""; sts.textContent = ""; }
+  // overlay tooltip
+  const hit = overlayHitTest(l, b, 9);
+  if(hit){
+    const rows = hit.fields.map((f, i) => {
+      const v = hit.row[i];
+      if(f === "name") return null;
+      return `<span style="color:var(--muted)">${f}</span> ${typeof v === "number" ? fmt(v) : (v ?? "–")}`;
+    }).filter(Boolean).join(" &nbsp; ");
+    showTip(mx, my, `<b>${hit.row[hit.fields.indexOf("name")]}</b><br>` +
+        `<span style="color:var(--muted);font-size:10px">${hit.label}</span><br>` + rows);
+  } else hideTip();
+}
+function showTip(x, y, html){
+  const t = $("tip");
+  t.innerHTML = html;
+  t.style.display = "block";
+  const st = $("stage").getBoundingClientRect();
+  t.style.left = Math.min(x + 14, st.width - 270) + "px";
+  t.style.top = Math.max(8, y - 14 - t.offsetHeight) + "px";
+}
+function hideTip(){ $("tip").style.display = "none"; }
+
+async function inspectAt(mx, my){
+  const p = unproject(mx, my);
+  if(!p) return;
+  const hit = overlayHitTest(p[0], p[1], 10);
+  if(hit){ showOverlayCard(hit, mx, my); return; }
+  if(DATA.filterCount < 3) return;
+  if(VIEW.dataset === "blink"){          // worker tree holds only one phase; use the cell map
+    const s = valueAtPixel(p[0], p[1]);
+    if(s !== 0xFFFFFFFF) showSourceCard(s, mx, my);
+    return;
+  }
+  const v = uvec(p[0], p[1]);
+  const r = await workerCall({type:"nearestPoint", v});
+  if(r.src < 0) return;
+  const sepLimit = Math.max(0.5, 12*medianNN);
+  if(r.sepDeg > sepLimit) { hideInspect(); return; }
+  showSourceCard(r.src, mx, my);
+}
+function showSourceCard(i, mx, my){
+  const [ra, dec] = galToEq(DATA.l[i], DATA.b[i]);
+  const rows = [
+    ["catalogue", catName(i)],
+    ["id", catId(i)],
+    ["l, b", DATA.l[i].toFixed(4) + "°, " + DATA.b[i].toFixed(4) + "°"],
+    ["RA, Dec", ra.toFixed(4) + "°, " + dec.toFixed(4) + "°"],
+    ["RM", fmt(getValues("rm")[i], 2) + " ± " + fmt(getValues("rm_err")[i], 2) + " rad m⁻²"],
+    ["Pol. int.", fmt(getValues("polint")[i], 3) + " mJy beam⁻¹"],
+    ["Frac. pol.", fmt(getValues("fracpol")[i], 2) + " %"],
+    ["S/N (PI)", fmt(getValues("snr")[i], 1)],
+    ["Stokes I", fmt(getValues("stokesI")[i], 3) + " mJy beam⁻¹"],
+    ["Spec. index", fmt(getValues("spidx")[i], 2)],
+    ["Pol. angle₀", fmt(getValues("polang")[i], 1) + "°"],
+  ];
+  if(DATA.cat[i] === 0) rows.push(["SBID", String(DATA.sbids[DATA.cols.sbid[i]])]);
+  else rows.push(["RACS tile", MANIFEST.sr.tiles[DATA.sr.tile[i - DATA.nP]]]);
+  const el = $("inspect");
+  el.innerHTML = `<div class="hd"><span>Component</span><span class="x">✕</span></div>
+    <div class="bd">` + rows.map(r =>
+      `<div class="kv"><span>${r[0]}</span><b>${r[1]}</b></div>`).join("") + `</div>
+    <div class="foot"><button class="mini" id="insp-copy">Copy JSON</button>
+    <button class="mini" id="insp-center">Centre view</button></div>`;
+  positionInspect(el, mx, my);
+  el.querySelector(".x").onclick = hideInspect;
+  $("insp-copy").onclick = () => {
+    const obj = {};
+    rows.forEach(r => obj[r[0]] = r[1]);
+    navigator.clipboard.writeText(JSON.stringify(obj, null, 2));
+  };
+  $("insp-center").onclick = () => flyTo(DATA.l[i], DATA.b[i], Math.max(VIEW.zoom, 12));
+}
+function showOverlayCard(hit, mx, my){
+  const el = $("inspect");
+  const rows = hit.fields.map((f, i) => [f, hit.row[i]]);
+  el.innerHTML = `<div class="hd"><span>${hit.row[hit.fields.indexOf("name")]}</span><span class="x">✕</span></div>
+    <div class="bd"><div class="kv"><span>overlay</span><b>${hit.label}</b></div>` +
+    rows.filter(r => r[0] !== "name").map(r =>
+      `<div class="kv"><span>${r[0]}</span><b>${typeof r[1] === "number" ? fmt(r[1]) : (r[1] ?? "–")}</b></div>`).join("") +
+    `</div><div class="foot"><button class="mini" id="insp-center">Centre view</button></div>`;
+  positionInspect(el, mx, my);
+  el.querySelector(".x").onclick = hideInspect;
+  const iL = hit.fields.indexOf("l"), iB = hit.fields.indexOf("b");
+  $("insp-center").onclick = () => flyTo(hit.row[iL], hit.row[iB], Math.max(VIEW.zoom, 8));
+}
+function positionInspect(el, mx, my){
+  el.style.display = "block";
+  const st = $("stage").getBoundingClientRect();
+  el.style.left = Math.min(mx + 16, st.width - 330) + "px";
+  el.style.top = Math.min(Math.max(10, my - 40), st.height - Math.min(420, el.offsetHeight) - 20) + "px";
+}
+function hideInspect(){ $("inspect").style.display = "none"; }
+
+/* ---------- navigation ----------------------------------------------- */
+let flyAnim = null;
+function displayCoordsOfGal(l, b){
+  if(VIEW.frame === "gal") return [l, b];
+  return galToEq(l, b);
+}
+function flyTo(l, b, zoom){
+  const [dl, db] = displayCoordsOfGal(l, b);
+  const start = {lon: VIEW.lon0, lat: VIEW.lat0, zoom: VIEW.zoom,
+                 panX: VIEW.panX, panY: VIEW.panY};
+  let dlon = ((dl - start.lon + 540) % 360) - 180;
+  const t0 = performance.now(), dur = 850;
+  cancelAnimationFrame(flyAnim);
+  function step(t){
+    const u = clamp((t - t0)/dur, 0, 1);
+    const e = u < 0.5 ? 2*u*u : 1 - Math.pow(-2*u + 2, 2)/2;
+    VIEW.lon0 = ((start.lon + dlon*e) % 360 + 360) % 360;
+    VIEW.lat0 = start.lat + (b !== undefined ? (db - start.lat)*e : 0);
+    if(zoom) VIEW.zoom = start.zoom*Math.pow(zoom/start.zoom, e);
+    VIEW.panX = start.panX*(1 - e); VIEW.panY = start.panY*(1 - e);
+    requestRender();
+    if(u < 1) flyAnim = requestAnimationFrame(step);
+    else { scheduleRefine(); saveHash(); }
+  }
+  flyAnim = requestAnimationFrame(step);
+}
+
+/* ---------- search ---------------------------------------------------- */
+let searchIndex = null;
+function buildSearchIndex(){
+  searchIndex = [];
+  for(const key of Object.keys(DATA.overlays)){
+    const ov = DATA.overlays[key];
+    const iN = ov.fields.indexOf("name"), iL = ov.fields.indexOf("l"), iB = ov.fields.indexOf("b");
+    if(iN < 0) continue;
+    for(const r of ov.rows)
+      searchIndex.push({n: String(r[iN]), nl: String(r[iN]).toLowerCase(), l: r[iL], b: r[iB], cat: ov.label});
+  }
+}
+function parseCoords(s){
+  // "l b", "l, b", "ra dec deg", sexagesimal "hh:mm:ss dd:mm:ss" or "12h34m -45d12m"
+  s = s.trim();
+  let m = s.match(/^(gal|eq|g|q)?\s*[: ]?\s*([+\-]?[\d.hms: ]+?)[,\s]+([+\-][\d.dms: ]+|[\d.dms:]+)$/i);
+  if(!m) return null;
+  const frame = (m[1] || "").toLowerCase().startsWith("g") ? "gal"
+              : (m[1] ? "eq" : (VIEW.frame === "gal" ? "gal" : "eq"));
+  function parseOne(t, isRA){
+    t = t.trim();
+    if(/[hms:dm°'"]/i.test(t)){
+      const neg = t.startsWith("-");
+      const parts = t.replace(/[hdms°'":]+/gi, " ").trim().split(/\s+/).map(Number);
+      if(parts.some(isNaN)) return NaN;
+      let v = Math.abs(parts[0]) + (parts[1] || 0)/60 + (parts[2] || 0)/3600;
+      if(/h/i.test(t) || (isRA && /:/g.test(t) && frame === "eq")) v *= 15;
+      return neg ? -v : v;
+    }
+    return parseFloat(t);
+  }
+  const a = parseOne(m[2], true), b = parseOne(m[3], false);
+  if(isNaN(a) || isNaN(b) || Math.abs(b) > 90) return null;
+  if(frame === "eq"){ const [l, bb] = eqToGal(a, b); return {l, b: bb, desc: `α=${fmt(a, 3)}° δ=${fmt(b, 3)}°`}; }
+  return {l: a, b, desc: `l=${fmt(a, 3)}° b=${fmt(b, 3)}°`};
+}
+function doSearch(qs){
+  const res = $("searchres");
+  qs = qs.trim();
+  if(!qs){ res.style.display = "none"; return; }
+  const items = [];
+  const co = parseCoords(qs);
+  if(co) items.push({n: "Go to " + co.desc, l: co.l, b: co.b, cat: "coordinates"});
+  const q = qs.toLowerCase();
+  let cnt = 0;
+  for(const it of searchIndex){
+    if(it.nl.includes(q)){ items.push(it); if(++cnt >= 12) break; }
+  }
+  if(!items.length){ res.style.display = "none"; return; }
+  res.innerHTML = items.map((it, i) =>
+    `<div class="sr" data-i="${i}"><span>${it.n}</span><small>${it.cat}</small></div>`).join("");
+  res.style.display = "block";
+  res.querySelectorAll(".sr").forEach(d => d.onclick = () => {
+    const it = items[+d.dataset.i];
+    res.style.display = "none";
+    $("searchbox").value = it.n;
+    flyTo(it.l, it.b, Math.max(VIEW.zoom, 6));
+  });
+}
+
+/* ---------- CSV import ------------------------------------------------ */
+function parseCSV(text){
+  // sniff delimiter
+  const lines = text.split(/\r?\n/).filter(x => x.trim().length && !x.startsWith("#"));
+  if(lines.length < 2) throw new Error("file has fewer than 2 non-comment rows");
+  const cand = [",", "\t", ";", "|"];
+  let delim = ",", bestN = 0;
+  for(const d of cand){
+    const n = lines[0].split(d).length;
+    if(n > bestN){ bestN = n; delim = d; }
+  }
+  function splitLine(ln){
+    if(delim !== ",") return ln.split(delim).map(s => s.trim());
+    const out = []; let cur = "", inQ = false;
+    for(const ch of ln){
+      if(ch === '"') inQ = !inQ;
+      else if(ch === "," && !inQ){ out.push(cur.trim()); cur = ""; }
+      else cur += ch;
+    }
+    out.push(cur.trim());
+    return out;
+  }
+  const header = splitLine(lines[0]);
+  const rows = [];
+  for(let i = 1; i < lines.length && rows.length < 400000; i++)
+    rows.push(splitLine(lines[i]));
+  return {header, rows};
+}
+function importDialog(parsed, fname){
+  const {header, rows} = parsed;
+  const guess = names => {
+    for(const n of names){
+      const i = header.findIndex(h => h.toLowerCase().replace(/[^a-z0-9]/g, "") === n);
+      if(i >= 0) return i;
+    }
+    for(const n of names){
+      const i = header.findIndex(h => h.toLowerCase().includes(n));
+      if(i >= 0) return i;
+    }
+    return -1;
+  };
+  const gRA = guess(["ra", "raj2000", "radeg", "ra_deg", "alpha"]);
+  const gDec = guess(["dec", "dej2000", "decdeg", "de", "dec_deg", "delta"]);
+  const gL = guess(["l", "glon", "gl"]);
+  const gB = guess(["b", "glat", "gb"]);
+  const gName = guess(["name", "id", "objid", "source", "designation"]);
+  const opts = header.map((h, i) => `<option value="${i}">${h}</option>`).join("");
+  const modeSel = (gL >= 0 && gB >= 0 && !(gRA >= 0 && gDec >= 0)) ? "gal" : "eq";
+  openModal(`Import: ${fname}`, `
+    <p>${rows.length.toLocaleString()} rows, ${header.length} columns. Choose the position columns:</p>
+    <table>
+      <tr><th>Coordinates</th><td><select id="imp-frame">
+        <option value="eq" ${modeSel === "eq" ? "selected" : ""}>RA / Dec (deg)</option>
+        <option value="gal" ${modeSel === "gal" ? "selected" : ""}>l / b (deg)</option></select></td></tr>
+      <tr><th>Lon column</th><td><select id="imp-lon">${opts}</select></td></tr>
+      <tr><th>Lat column</th><td><select id="imp-lat">${opts}</select></td></tr>
+      <tr><th>Name column</th><td><select id="imp-name"><option value="-1">(row number)</option>${opts}</select></td></tr>
+    </table>
+    <p>Numeric columns (up to 4) become filter sliders automatically.</p>`,
+    [["Cancel", closeModal], ["Import", () => {
+      const fr = $("imp-frame").value;
+      const iLon = +$("imp-lon").value, iLat = +$("imp-lat").value, iName = +$("imp-name").value;
+      closeModal();
+      finishImport(parsed, fname, fr, iLon, iLat, iName);
+    }, true]]);
+  $("imp-lon").value = String(modeSel === "gal" ? gL : (gRA >= 0 ? gRA : 0));
+  $("imp-lat").value = String(modeSel === "gal" ? gB : (gDec >= 0 ? gDec : 1));
+  if(gName >= 0) $("imp-name").value = String(gName);
+}
+function finishImport(parsed, fname, frame, iLon, iLat, iName){
+  const {header, rows} = parsed;
+  // find numeric columns
+  const numeric = [];
+  for(let c = 0; c < header.length; c++){
+    if(c === iLon || c === iLat || c === iName) continue;
+    let ok = 0, tot = 0;
+    for(let r = 0; r < Math.min(rows.length, 200); r++){
+      const v = rows[r][c];
+      if(v === undefined || v === "") continue;
+      tot++;
+      if(isFinite(parseFloat(v))) ok++;
+    }
+    if(tot > 0 && ok/tot > 0.9) numeric.push(c);
+    if(numeric.length >= 4) break;
+  }
+  const fields = ["name", "l", "b", ...numeric.map(c => header[c])];
+  const out = [];
+  let mins = numeric.map(() => Infinity), maxs = numeric.map(() => -Infinity);
+  for(let r = 0; r < rows.length; r++){
+    const lon = parseFloat(rows[r][iLon]), lat = parseFloat(rows[r][iLat]);
+    if(!isFinite(lon) || !isFinite(lat) || Math.abs(lat) > 90) continue;
+    let l = lon, b = lat;
+    if(frame === "eq"){ [l, b] = eqToGal(lon, lat); }
+    const row = [iName >= 0 ? rows[r][iName] : "row " + (r + 1), +l.toFixed(4), +b.toFixed(4)];
+    numeric.forEach((c, k) => {
+      const v = parseFloat(rows[r][c]);
+      row.push(isFinite(v) ? v : null);
+      if(isFinite(v)){ if(v < mins[k]) mins[k] = v; if(v > maxs[k]) maxs[k] = v; }
+    });
+    out.push(row);
+  }
+  if(!out.length){ alert("No rows with valid coordinates found."); return; }
+  const key = "import" + (++importCount);
+  DATA.overlays[key] = {
+    label: fname.replace(/\.[a-z]+$/i, "") + " (imported)",
+    kind: "points",
+    desc: out.length.toLocaleString() + " rows imported from " + fname,
+    fields,
+    filters: numeric.map((c, k) => ({field: header[c], label: header[c],
+        min: mins[k], max: maxs[k], log: mins[k] > 0 && maxs[k]/Math.max(mins[k], 1e-12) > 300})),
+    rows: out,
+  };
+  overlayState[key] = {enabled: true, showLabels: false, filters: {},
+      style: {color: IMPORT_COLORS[(importCount - 1) % IMPORT_COLORS.length], ptSize: 3.0, maxLabels: 12}};
+  addOverlayCard(key);
+  buildSearchIndexDebounced();
+  refreshOverlay(key);
+  $("sec-overlays").classList.add("open");
+}
+const buildSearchIndexDebounced = debounce(buildSearchIndex, 300);
+
+/* ---------- modal ------------------------------------------------------ */
+function openModal(title, bodyHTML, buttons){
+  $("modal").innerHTML = `<div class="hd">${title}</div><div class="bd">${bodyHTML}</div>
+    <div class="ft">${(buttons || []).map((b, i) =>
+      `<button data-mb="${i}" class="${b[2] ? "primary" : ""}">${b[0]}</button>`).join("")}</div>`;
+  $("modalback").style.display = "flex";
+  (buttons || []).forEach((b, i) => {
+    $("modal").querySelector(`[data-mb="${i}"]`).onclick = b[1];
+  });
+}
+function closeModal(){ $("modalback").style.display = "none"; }
+
+/* ---------- export ------------------------------------------------------ */
+function download(blob, name){
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+function exportImage(kind){
+  const scale = +$("exportscale").value;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  // re-render GL at export resolution
+  const oldDpr = devicePixelRatio_;
+  devicePixelRatio_ = scale;
+  canvas.width = w*scale; canvas.height = h*scale;
+  labelCanvas.width = w*scale; labelCanvas.height = h*scale;
+  render();
+  const out = document.createElement("canvas");
+  out.width = w*scale; out.height = h*scale + Math.round(86*scale);
+  const ctx = out.getContext("2d");
+  const th = THEMES[VIEW.theme];
+  ctx.fillStyle = VIEW.theme === "light" ? "#ffffff" : "#0b0e14";
+  ctx.fillRect(0, 0, out.width, out.height);
+  ctx.drawImage(canvas, 0, 0);
+  // labels (DOM divs) drawn manually
+  ctx.save();
+  ctx.scale(scale, scale);
+  ctx.font = "600 11px -apple-system, 'Segoe UI', sans-serif";
+  ctx.textAlign = "center";
+  for(const key of Object.keys(overlayGL)){
+    const og = overlayGL[key];
+    if(!og.enabled || !og.labels || !og.showLabels) continue;
+    let placed = 0;
+    ctx.fillStyle = og.labelColor || "#ffe9c4";
+    for(const lb of og.labels){
+      if(placed >= og.maxLabels) break;
+      const p = project(lb.l, lb.b);
+      if(!p || p[2] < 0.05 || p[0] < 0 || p[0] > w || p[1] < 0 || p[1] > h) continue;
+      ctx.shadowColor = "#000"; ctx.shadowBlur = 3;
+      ctx.fillText(lb.html.replace(/<[^>]+>/g, ""), p[0], p[1] - 6);
+      placed++;
+    }
+  }
+  ctx.shadowBlur = 0;
+  // graticule labels from the label canvas
+  ctx.restore();
+  ctx.drawImage(labelCanvas, 0, 0, labelCanvas.width, labelCanvas.height, 0, 0, w*scale, h*scale);
+  // footer strip: colour bar + provenance
+  ctx.save();
+  ctx.scale(scale, scale);
+  const cbW = Math.min(430, w - 260), cbX = (w - cbW)/2;
+  if(VIEW.mapmode !== "bubble" || VIEW.quantity !== "rm")
+    drawColorbar(ctx, cbX, h + 6, cbW, 40, 10);
+  else drawColorbar(ctx, cbX, h + 6, cbW, 40, 10);
+  ctx.fillStyle = VIEW.theme === "light" ? "#222" : "#dfe4ee";
+  ctx.font = "12px -apple-system, 'Segoe UI', sans-serif";
+  ctx.textAlign = "center";
+  const q = QUANTITIES[VIEW.quantity];
+  ctx.fillText(q.label + (q.unit ? " / " + q.unit : ""), w/2, h + 62);
+  ctx.font = "10px -apple-system, 'Segoe UI', sans-serif";
+  ctx.fillStyle = VIEW.theme === "light" ? "#777" : "#8c95a8";
+  ctx.textAlign = "left";
+  ctx.fillText("POSSUM DR1 · " + DATA.filterCount.toLocaleString() + " components · " +
+      (VIEW.frame === "gal" ? "Galactic" : "Equatorial") + " frame", 12, h + 62);
+  ctx.textAlign = "right";
+  ctx.fillText(new Date().toISOString().slice(0, 10), w - 12, h + 62);
+  ctx.restore();
+  // restore live canvas
+  devicePixelRatio_ = oldDpr;
+  resize(); render();
+  if(kind === "png"){
+    out.toBlob(bl => download(bl, "possum_dr1_" + VIEW.quantity + "_view.png"), "image/png");
+  } else {
+    const jpeg = out.toDataURL("image/jpeg", 0.93);
+    const pdf = jpegToPdf(jpeg, out.width, out.height);
+    download(new Blob([pdf], {type: "application/pdf"}), "possum_dr1_" + VIEW.quantity + "_view.pdf");
+  }
+}
+function jpegToPdf(dataUri, wpx, hpx){
+  const b64 = dataUri.split(",")[1];
+  const bin = atob(b64);
+  const img = new Uint8Array(bin.length);
+  for(let i = 0; i < bin.length; i++) img[i] = bin.charCodeAt(i);
+  const W = wpx*0.75, H = hpx*0.75;   // 96dpi -> pt
+  const enc = new TextEncoder();
+  const chunks = [];
+  const offsets = [];
+  let pos = 0;
+  function push(s){
+    const b = typeof s === "string" ? enc.encode(s) : s;
+    chunks.push(b);
+    pos += b.length;
+  }
+  push("%PDF-1.4\n");
+  offsets[1] = pos; push("1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n");
+  offsets[2] = pos; push("2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n");
+  offsets[3] = pos; push(`3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 ${W.toFixed(2)} ${H.toFixed(2)}]` +
+      `/Resources<</XObject<</Im1 4 0 R>>>>/Contents 5 0 R>>endobj\n`);
+  offsets[4] = pos;
+  push(`4 0 obj<</Type/XObject/Subtype/Image/Width ${wpx}/Height ${hpx}` +
+      `/ColorSpace/DeviceRGB/BitsPerComponent 8/Filter/DCTDecode/Length ${img.length}>>stream\n`);
+  push(img);
+  push("\nendstream endobj\n");
+  const content = `q ${W.toFixed(2)} 0 0 ${H.toFixed(2)} 0 0 cm /Im1 Do Q`;
+  offsets[5] = pos; push(`5 0 obj<</Length ${content.length}>>stream\n${content}\nendstream endobj\n`);
+  const xref = pos;
+  push("xref\n0 6\n0000000000 65535 f \n");
+  for(let i = 1; i <= 5; i++) push(String(offsets[i]).padStart(10, "0") + " 00000 n \n");
+  push(`trailer<</Size 6/Root 1 0 R>>\nstartxref\n${xref}\n%%EOF`);
+  const total = new Uint8Array(pos);
+  let o = 0;
+  for(const c of chunks){ total.set(c, o); o += c.length; }
+  return total;
+}
+function exportCSV(){
+  const idx = DATA.filteredIdx;
+  const cols = ["id", "catalogue", "ra_deg", "dec_deg", "l_deg", "b_deg", "rm_radm2", "rm_err_radm2",
+      "polint_mJy", "fracpol_pct", "snr_pi", "stokesI_mJy", "spectral_index", "polangle0_deg", "sbid_or_tile"];
+  const V = {
+    rm: getValues("rm"), rm_err: getValues("rm_err"), polint: getValues("polint"),
+    fracpol: getValues("fracpol"), snr: getValues("snr"), stokesI: getValues("stokesI"),
+    spidx: getValues("spidx"), polang: getValues("polang"),
+  };
+  const parts = [cols.join(",") + "\n"];
+  let buf = "";
+  for(let k = 0; k < idx.length; k++){
+    const i = idx[k];
+    const [ra, dec] = galToEq(DATA.l[i], DATA.b[i]);
+    const tail = DATA.cat[i] === 0 ? DATA.sbids[DATA.cols.sbid[i]]
+        : MANIFEST.sr.tiles[DATA.sr.tile[i - DATA.nP]];
+    buf += catId(i) + "," + catName(i) + "," + ra.toFixed(5) + "," + dec.toFixed(5) + "," +
+        DATA.l[i].toFixed(5) + "," + DATA.b[i].toFixed(5) + "," +
+        V.rm[i].toFixed(3) + "," + V.rm_err[i].toFixed(4) + "," +
+        V.polint[i].toFixed(4) + "," + V.fracpol[i].toFixed(3) + "," +
+        V.snr[i].toFixed(2) + "," + V.stokesI[i].toFixed(4) + "," +
+        V.spidx[i].toFixed(3) + "," + V.polang[i].toFixed(2) + "," +
+        tail + "\n";
+    if(buf.length > 4e6){ parts.push(buf); buf = ""; }
+  }
+  parts.push(buf);
+  download(new Blob(parts, {type: "text/csv"}), "possum_dr1_selection_" + idx.length + "rows.csv");
+}
+
+/* ---------- URL hash state --------------------------------------------- */
+let hashLock = false;
+const saveHash = debounce(() => {
+  if(hashLock) return;
+  const s = [VIEW.proj, VIEW.frame, VIEW.quantity, VIEW.mapmode, VIEW.lon0.toFixed(2),
+      VIEW.lat0.toFixed(2), VIEW.zoom.toFixed(3), VIEW.cmap, VIEW.stretch,
+      VIEW.vmin.toPrecision(5), VIEW.vmax.toPrecision(5), VIEW.theme].join("|");
+  try{ history.replaceState(null, "", "#" + encodeURIComponent(s)); }catch(e){}
+}, 400);
+function loadHash(){
+  try{
+    const h = decodeURIComponent(location.hash.slice(1));
+    if(!h) return false;
+    const p = h.split("|");
+    if(p.length < 12) return false;
+    VIEW.proj = p[0]; VIEW.frame = p[1]; VIEW.quantity = p[2]; VIEW.mapmode = p[3];
+    VIEW.lon0 = +p[4]; VIEW.lat0 = +p[5]; VIEW.zoom = +p[6];
+    VIEW.cmap = p[7]; VIEW.stretch = p[8]; VIEW.vmin = +p[9]; VIEW.vmax = +p[10];
+    VIEW.theme = p[11];
+    return true;
+  }catch(e){ return false; }
+}
+
+/* ---------- pointer interaction ----------------------------------------- */
+function initInteraction(){
+  let dragging = false, moved = 0, lx = 0, ly = 0;
+  let regionDrag = false;
+  let inertiaVx = 0, inertiaVy = 0, lastT = 0;
+  canvas.addEventListener("pointerdown", e => {
+    const rect = canvas.getBoundingClientRect();
+    if(VIEW.tool === "region"){
+      const p = unproject(e.clientX - rect.left, e.clientY - rect.top);
+      if(p){
+        regionDrag = true;
+        REGION.dragging = true; REGION.active = false;
+        REGION.l = p[0]; REGION.b = p[1]; REGION.radius = 0.05;
+        buildRegionGeometry();
+        canvas.setPointerCapture(e.pointerId);
+        requestRender();
+      }
+      return;
+    }
+    dragging = true; moved = 0;
+    lx = e.clientX; ly = e.clientY; lastT = performance.now();
+    inertiaVx = inertiaVy = 0;
+    canvas.setPointerCapture(e.pointerId);
+    canvas.classList.add("dragging");
+    cancelAnimationFrame(flyAnim);
+  });
+  canvas.addEventListener("pointermove", e => {
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    if(regionDrag){
+      const p = unproject(mx, my);
+      if(p){
+        const v1 = uvec(REGION.l, REGION.b), v2 = uvec(p[0], p[1]);
+        const d = Math.hypot(v1[0]-v2[0], v1[1]-v2[1], v1[2]-v2[2]);
+        REGION.radius = Math.min(20, Math.max(0.05, 2*Math.asin(Math.min(1, d/2))*R2D));
+        buildRegionGeometry();
+        requestRender();
+      }
+      return;
+    }
+    if(dragging){
+      const dx = e.clientX - lx, dy = e.clientY - ly;
+      moved += Math.abs(dx) + Math.abs(dy);
+      applyDrag(dx, dy);
+      const now = performance.now();
+      const dt = Math.max(1, now - lastT);
+      inertiaVx = 0.8*inertiaVx + 0.2*dx/dt;
+      inertiaVy = 0.8*inertiaVy + 0.2*dy/dt;
+      lastT = now;
+      lx = e.clientX; ly = e.clientY;
+    } else {
+      updateStatus(mx, my);
+    }
+  });
+  canvas.addEventListener("pointerup", e => {
+    if(regionDrag){
+      regionDrag = false;
+      REGION.dragging = false;
+      REGION.active = true;
+      finalizeRegion();
+      return;
+    }
+    if(!dragging) return;
+    dragging = false;
+    canvas.classList.remove("dragging");
+    if(moved < 5){
+      const rect = canvas.getBoundingClientRect();
+      const cx = e.clientX - rect.left, cy = e.clientY - rect.top;
+      if(VIEW.tool === "identify") identifyAt(cx, cy);
+      else inspectAt(cx, cy);
+    } else {
+      // inertia
+      let vx = inertiaVx*14, vy = inertiaVy*14;
+      function coast(){
+        vx *= 0.93; vy *= 0.93;
+        if(Math.abs(vx) + Math.abs(vy) < 0.4){ scheduleRefine(); saveHash(); return; }
+        applyDrag(vx, vy);
+        requestAnimationFrame(coast);
+      }
+      if(Math.abs(vx) + Math.abs(vy) > 2) requestAnimationFrame(coast);
+      else { scheduleRefine(); saveHash(); }
+    }
+  });
+  function applyDrag(dx, dy){
+    if(VIEW.proj === "globe"){
+      const s = globeScale();
+      VIEW.lon0 = ((VIEW.lon0 + dx/s*R2D) % 360 + 360) % 360;
+      VIEW.lat0 = clamp(VIEW.lat0 + dy/s*R2D, -89.9, 89.9);
+    } else {
+      const s = mollScale();
+      VIEW.lon0 = ((VIEW.lon0 + dx*Math.PI/(2*Math.SQRT2*s)*R2D/1.15) % 360 + 360) % 360;
+      VIEW.panY = clamp(VIEW.panY + dy, -s*3*VIEW.zoom, s*3*VIEW.zoom);
+      if(VIEW.zoom <= 1.02) VIEW.panY = 0;
+    }
+    requestRender();
+  }
+  canvas.addEventListener("wheel", e => {
+    e.preventDefault();
+    const k = Math.exp(-e.deltaY*0.0016);
+    const z0 = VIEW.zoom;
+    VIEW.zoom = clamp(VIEW.zoom*k, 0.55, 320);
+    const kk = VIEW.zoom/z0;
+    if(VIEW.proj === "globe" && kk !== 1){
+      // keep the sky point under the cursor fixed: rotate view centre toward it
+      const rect = canvas.getBoundingClientRect();
+      const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+      const p = unproject(mx, my);
+      if(p){
+        const [dl, db] = displayCoordsOfGal(p[0], p[1]);
+        let ddl = ((dl - VIEW.lon0 + 540) % 360) - 180;
+        const f = 1 - 1/kk;
+        VIEW.lon0 = ((VIEW.lon0 + ddl*f) % 360 + 360) % 360;
+        VIEW.lat0 = clamp(VIEW.lat0 + (db - VIEW.lat0)*f, -89.9, 89.9);
+      }
+    } else if(kk !== 1){
+      const rect = canvas.getBoundingClientRect();
+      const mx = e.clientX - rect.left - rect.width/2, my = e.clientY - rect.top - rect.height/2;
+      VIEW.panX = mx - (mx - VIEW.panX)*kk;
+      VIEW.panY = my - (my - VIEW.panY)*kk;
+      if(VIEW.zoom <= 1.02){ VIEW.panX = 0; VIEW.panY = 0; }
+    }
+    requestRender();
+    scheduleRefine();
+    saveHash();
+  }, {passive: false});
+  canvas.addEventListener("dblclick", e => {
+    const rect = canvas.getBoundingClientRect();
+    const p = unproject(e.clientX - rect.left, e.clientY - rect.top);
+    if(p) flyTo(p[0], p[1], VIEW.zoom*2.4);
+  });
+  canvas.addEventListener("mouseleave", () => { hideTip(); });
+  // touch pinch
+  window.addEventListener("keyup", () => { nudgeStreak = 0; });
+  window.addEventListener("keydown", e => {
+    if(e.target.tagName === "INPUT" || e.target.tagName === "SELECT" || e.target.tagName === "TEXTAREA") return;
+    if(activeTab === "region" && REGION.active &&
+       ["ArrowLeft","ArrowRight","ArrowUp","ArrowDown","+","=","-","_"].includes(e.key)){
+      e.preventDefault();
+      nudgeRegion(e);
+      return;
+    }
+    const stepDeg = 12/VIEW.zoom;
+    if(e.key === "ArrowLeft"){ VIEW.lon0 = (VIEW.lon0 + stepDeg + 360) % 360; requestRender(); scheduleRefine(); }
+    else if(e.key === "ArrowRight"){ VIEW.lon0 = (VIEW.lon0 - stepDeg + 360) % 360; requestRender(); scheduleRefine(); }
+    else if(e.key === "ArrowUp"){ VIEW.lat0 = clamp(VIEW.lat0 + stepDeg, -89.9, 89.9); requestRender(); scheduleRefine(); }
+    else if(e.key === "ArrowDown"){ VIEW.lat0 = clamp(VIEW.lat0 - stepDeg, -89.9, 89.9); requestRender(); scheduleRefine(); }
+    else if(e.key === "+" || e.key === "="){ VIEW.zoom = clamp(VIEW.zoom*1.3, 0.55, 320); requestRender(); scheduleRefine(); }
+    else if(e.key === "-"){ VIEW.zoom = clamp(VIEW.zoom/1.3, 0.55, 320); requestRender(); scheduleRefine(); }
+    else if(e.key.toLowerCase() === "g"){ $("grid-gal").checked = VIEW.gridGal = !VIEW.gridGal; requestRender(); }
+    else if(e.key.toLowerCase() === "b"){ setMapMode(VIEW.mapmode === "tess" ? "bubble" : "tess"); }
+    else if(e.key.toLowerCase() === "r"){ resetView(); }
+    else if(e.key === "1"){ setTool("explore"); }
+    else if(e.key === "2"){ setTool("region"); }
+    else if(e.key === "3"){ setTool("identify"); }
+    else if(e.key === "?"){ showHelp(); }
+    else if(e.key === "Escape"){ hideInspect(); closeModal(); if(activeTab === "region") setTab("explorer"); }
+  });
+}
+function resetView(){
+  VIEW.lon0 = 285; VIEW.lat0 = -40; VIEW.zoom = 1.0; VIEW.panX = 0; VIEW.panY = 0;
+  if(VIEW.proj === "mollweide"){ VIEW.lon0 = 0; VIEW.lat0 = 0; }
+  requestRender(); scheduleRefine(); saveHash();
+}
+
+/* ---------- tools & tabs ------------------------------------------------- */
+function setTool(t){
+  VIEW.tool = t;
+  for(const k of ["explore", "region", "identify"])
+    $("tool-" + k).classList.toggle("active", k === t);
+  $("regionhint").style.display = (t === "region" && !REGION.active) ? "block" : "none";
+  canvas.style.cursor = t === "explore" ? "grab" : "crosshair";
+  hideInspect();
+}
+let activeTab = "explorer";
+function setTab(t){
+  activeTab = t;
+  hideInspect();
+  hideTip();
+  $("tab-explorer").classList.toggle("active", t === "explorer");
+  $("tab-region").classList.toggle("active", t === "region");
+  $("regiontab").style.display = t === "region" ? "block" : "none";
+  if(t === "region") renderRegionTab();
+}
+
+/* ---------- region analysis ---------------------------------------------- */
+function robustStats(vals){
+  if(!vals.length) return null;
+  const s = Float64Array.from(vals).sort();
+  const n = s.length;
+  const med = n % 2 ? s[(n-1)/2] : 0.5*(s[n/2-1] + s[n/2]);
+  let mean = 0;
+  for(let i=0;i<n;i++) mean += s[i];
+  mean /= n;
+  let sd = 0;
+  for(let i=0;i<n;i++) sd += (s[i]-mean)*(s[i]-mean);
+  sd = Math.sqrt(sd/Math.max(1, n-1));
+  const ad = Float64Array.from(s, v => Math.abs(v - med)).sort();
+  const mad = n % 2 ? ad[(n-1)/2] : 0.5*(ad[n/2-1] + ad[n/2]);
+  return {n, mean, median: med, std: sd, madStd: 1.4826*mad, min: s[0], max: s[n-1]};
+}
+function regionMembers(){
+  // indices of filtered sources inside REGION, with separations
+  const c = uvec(REGION.l, REGION.b);
+  const cosr = Math.cos(REGION.radius*D2R);
+  const idx = DATA.filteredIdx;
+  const out = [], seps = [];
+  for(let k=0;k<idx.length;k++){
+    const i = idx[k];
+    const dot = DATA.ux[i]*c[0] + DATA.uy[i]*c[1] + DATA.uz[i]*c[2];
+    if(dot >= cosr){
+      out.push(i);
+      seps.push(Math.acos(Math.min(1, dot))*R2D);
+    }
+  }
+  return {idx: Uint32Array.from(out), sep: Float32Array.from(seps)};
+}
+function setRegionMembers(m){
+  REGION.idx = m.idx; REGION.sep = m.sep;
+  const n = m.idx.length;
+  const order = Array.from(m.idx.keys()).sort((a, b) => m.sep[a] - m.sep[b]);
+  const rm = getValues("rm");
+  REGION.sIdx = new Uint32Array(n); REGION.sSep = new Float32Array(n);
+  REGION.sRM = new Float32Array(n); REGION.sCat = new Uint8Array(n);
+  REGION.pSum = new Float64Array(n + 1); REGION.pSum2 = new Float64Array(n + 1);
+  REGION.pCnt = new Uint32Array(n + 1);    // count of finite-RM members (NaN-safe sums)
+  for(let k = 0; k < n; k++){
+    const i = m.idx[order[k]];
+    REGION.sIdx[k] = i;
+    REGION.sSep[k] = m.sep[order[k]];
+    REGION.sRM[k] = rm[i];
+    REGION.sCat[k] = DATA.cat[i];
+    const ok = isFinite(rm[i]);
+    REGION.pSum[k + 1] = REGION.pSum[k] + (ok ? rm[i] : 0);
+    REGION.pSum2[k + 1] = REGION.pSum2[k] + (ok ? rm[i]*rm[i] : 0);
+    REGION.pCnt[k + 1] = REGION.pCnt[k] + (ok ? 1 : 0);
+  }
+}
+function finalizeRegion(){
+  $("regionhint").style.display = "none";
+  DS9.refRM = DS9.refP = DS9.refPI = null;   // fresh region -> fresh scaling defaults
+  setRegionMembers(regionMembers());
+  REGION.quantity = VIEW.quantity;
+  $("tab-region").querySelector(".dot").style.display = "inline-block";
+  requestRender();
+  showRegionCard();
+}
+function regionValues(q){
+  const vals = getValues(q);
+  const out = [];
+  for(const i of REGION.idx){
+    const v = vals[i];
+    if(isFinite(v)) out.push(v);
+  }
+  return out;
+}
+function showRegionCard(){
+  const el = $("inspect");
+  const rmStats = robustStats(regionValues("rm"));
+  let nS = 0;
+  for(const i of REGION.idx) if(DATA.cat[i]) nS++;
+  const rows = [
+    ["centre", REGION.l.toFixed(3) + "°, " + REGION.b.toFixed(3) + "° (gal)"],
+    ["radius", REGION.radius.toFixed(2) + "°"],
+    ["components", REGION.idx.length.toLocaleString() +
+        (nS ? ` (${(REGION.idx.length-nS).toLocaleString()} P + ${nS.toLocaleString()} SR)` : "")],
+  ];
+  if(rmStats) rows.push(
+    ["⟨RM⟩ mean", fmt(rmStats.mean, 2) + " rad m⁻²"],
+    ["RM median", fmt(rmStats.median, 2) + " rad m⁻²"],
+    ["RM σ", fmt(rmStats.std, 2) + " rad m⁻²"],
+    ["RM σ_MAD", fmt(rmStats.madStd, 2) + " rad m⁻²"]);
+  el.innerHTML = `<div class="hd"><span style="color:#38ff6e">&#9678; Region</span><span class="x">✕</span></div>
+    <div class="bd">` + rows.map(r =>
+      `<div class="kv"><span>${r[0]}</span><b>${r[1]}</b></div>`).join("") + `</div>
+    <div class="foot">
+      <button class="mini primary" id="reg-analyse">Analysis tab</button>
+      <button class="mini" id="reg-csv">Export CSV</button>
+      <button class="mini" id="reg-clear">Clear</button></div>`;
+  const st = $("stage").getBoundingClientRect();
+  const p = project(REGION.l, REGION.b) || [st.width/2, st.height/2];
+  positionInspect(el, Math.min(p[0] + 30, st.width - 340), p[1]);
+  el.querySelector(".x").onclick = hideInspect;
+  $("reg-analyse").onclick = () => { hideInspect(); setTab("region"); };
+  $("reg-csv").onclick = exportRegionCSV;
+  $("reg-clear").onclick = clearRegion;
+}
+function clearRegion(){
+  REGION.active = false; REGION.idx = null;
+  REGION.lineCount = 0;
+  $("tab-region").querySelector(".dot").style.display = "none";
+  hideInspect();
+  if(activeTab === "region") renderRegionTab();
+  requestRender();
+}
+
+let histState = {q: "rm", logy: false, nbins: 60};
+function renderRegionTab(){
+  const host = $("regiontab");
+  if(!REGION.active || !REGION.idx){
+    host.innerHTML = `<h2>Region analysis</h2>
+      <div class="sub">No region defined yet.</div>
+      <div class="rt-section" style="max-width:560px">
+        <p style="color:var(--ink2);font-size:12.5px;line-height:1.7">Go to the
+        <b>Explorer</b> tab, choose the <b style="color:#38ff6e">&#9678; Region</b> tool
+        (or press <b>2</b>), then click the region centre on the sky, hold, and drag
+        outward — release to fix the circle (max radius 20°). Statistics, a histogram,
+        an RM–separation profile and exports will appear here.</p>
+        <div class="btnrow"><button class="primary" id="rt-goexplore">&larr; Back to Explorer</button></div>
+      </div>`;
+    $("rt-goexplore").onclick = () => { setTab("explorer"); setTool("region"); };
+    return;
+  }
+  let nS = 0;
+  for(const i of REGION.idx) if(DATA.cat[i]) nS++;
+  const area = 2*Math.PI*(1 - Math.cos(REGION.radius*D2R))*(R2D*R2D);
+  const [cra, cdec] = galToEq(REGION.l, REGION.b);
+  const qopts = Object.keys(QUANTITIES).map(k =>
+    `<option value="${k}" ${k === histState.q ? "selected" : ""}>${QUANTITIES[k].label}</option>`).join("");
+  host.innerHTML = `
+    <h2>Region analysis</h2>
+    <div class="sub" id="rt-sub">Circle of radius <b id="rt-rad">${REGION.radius.toFixed(2)}°</b> centred on
+      <span id="rt-centre">l=${REGION.l.toFixed(3)}°, b=${REGION.b.toFixed(3)}°
+      (α=${cra.toFixed(3)}°, δ=${cdec.toFixed(3)}°)</span> · <span id="rt-area">${area.toFixed(1)}</span> deg² ·
+      current source filters applied</div>
+    <div class="btnrow">
+      <button class="primary" id="rt-csv">Export region CSV</button>
+      <button id="rt-ds9">Aladin / DS9 regions&hellip;</button>
+      <button id="rt-copy">Copy stats</button>
+      <button id="rt-clear">Clear region</button>
+      <button id="rt-back">&larr; Back to Explorer</button>
+    </div>
+    <div class="rt-section">
+      <h3>Cutout — ${QUANTITIES[VIEW.quantity].label} (same colour scale &amp; filters as the main map)</h3>
+      <canvas id="cutcanvas"></canvas>
+      <div class="hint">Arrow keys nudge the region (hold to accelerate) · <b>+</b>/<b>−</b> grow/shrink the radius ·
+        everything on this page updates live.</div>
+    </div>
+    <div class="statgrid" id="rt-stats"></div>
+    <div class="rt-section">
+      <h3>RM vs separation from region centre</h3>
+      <div class="chips" id="prof-chips"></div>
+      <div class="ctlrow">
+        <div id="prof-win"></div>
+        <div id="prof-bin"></div>
+        <button class="mini" id="prof-png" style="margin-bottom:4px">Profile PNG</button>
+      </div>
+      <canvas id="profcanvas"></canvas>
+    </div>
+    <div class="rt-section">
+      <h3>Distribution</h3>
+      <div class="row" style="max-width:640px">
+        <label>Quantity</label><select id="rt-q" style="width:220px">${qopts}</select>
+        <label>Bins</label><input type="number" id="rt-bins" value="${histState.nbins}" min="8" max="300" style="width:64px">
+        <label class="check" style="margin:0"><input type="checkbox" id="rt-logy" ${histState.logy ? "checked" : ""}> log N</label>
+        <button class="mini" id="rt-hist-png">PNG</button>
+      </div>
+      <canvas id="histcanvas"></canvas>
+    </div>
+    <div class="rt-section">
+      <h3>Sources (first 300 by separation)</h3>
+      <div id="regtablewrap"><table id="regtable"></table></div>
+    </div>`;
+  $("rt-csv").onclick = exportRegionCSV;
+  $("rt-ds9").onclick = showDs9Modal;
+  $("rt-hist-png").onclick = exportHistPNG;
+  $("rt-clear").onclick = clearRegion;
+  $("rt-back").onclick = () => setTab("explorer");
+  safeDraw(buildProfileControls);
+  safeDraw(drawProfile);
+  safeDraw(drawCutout);
+  ensureCutout();
+  $("rt-q").onchange = e => { histState.q = e.target.value; renderRegionStats(); drawHistogram(); };
+  $("rt-bins").onchange = e => { histState.nbins = clamp(+e.target.value, 8, 300); drawHistogram(); };
+  $("rt-logy").onchange = e => { histState.logy = e.target.checked; drawHistogram(); };
+  $("rt-copy").onclick = () => {
+    const obj = {centre_gal: [REGION.l, REGION.b], centre_eq: [cra, cdec],
+                 radius_deg: REGION.radius, area_deg2: area,
+                 n: REGION.idx.length, n_possum: REGION.idx.length - nS, n_spiceracs: nS};
+    for(const q of ["rm", histState.q]){
+      const s = robustStats(regionValues(q));
+      if(s) obj[q] = {mean: s.mean, median: s.median, std: s.std, mad_std: s.madStd,
+                      min: s.min, max: s.max, unit: QUANTITIES[q].unit};
+    }
+    navigator.clipboard.writeText(JSON.stringify(obj, null, 2));
+  };
+  safeDraw(renderRegionStats);
+  safeDraw(drawHistogram);
+  safeDraw(renderRegionTable);
+}
+function renderRegionStats(){
+  let nS = 0;
+  for(const i of REGION.idx) if(DATA.cat[i]) nS++;
+  const area = 2*Math.PI*(1 - Math.cos(REGION.radius*D2R))*(R2D*R2D);
+  const rm = robustStats(regionValues("rm"));
+  const q = histState.q;
+  const qs = q === "rm" ? rm : robustStats(regionValues(q));
+  const cards = [
+    ["components", REGION.idx.length.toLocaleString(), ""],
+    ["POSSUM / SPICE-RACS", (REGION.idx.length - nS).toLocaleString() + " / " + nS.toLocaleString(), ""],
+    ["density", (REGION.idx.length/area).toFixed(1), "deg⁻²"],
+  ];
+  if(rm) cards.push(
+    ["RM mean", fmt(rm.mean, 2), "rad m⁻²"],
+    ["RM median", fmt(rm.median, 2), "rad m⁻²"],
+    ["RM std dev", fmt(rm.std, 2), "rad m⁻²"],
+    ["RM σ (1.4826×MAD)", fmt(rm.madStd, 2), "rad m⁻²"]);
+  if(q !== "rm" && qs){
+    const Q = QUANTITIES[q];
+    cards.push(
+      [Q.label + " mean", fmt(qs.mean, Q.dec), Q.unit],
+      [Q.label + " median", fmt(qs.median, Q.dec), Q.unit],
+      [Q.label + " σ_MAD", fmt(qs.madStd, Q.dec), Q.unit]);
+  }
+  $("rt-stats").innerHTML = cards.map(c =>
+    `<div class="stat"><div class="k">${c[0]}</div><div class="v">${c[1]} <span class="u">${c[2]}</span></div></div>`).join("");
+}
+function drawHistogram(){
+  const cv = $("histcanvas");
+  if(!cv) return;
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const W = cv.clientWidth || 800, H = 300;
+  cv.width = W*dpr; cv.height = H*dpr;
+  const ctx = cv.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, W, H);
+  const q = histState.q, Q = QUANTITIES[q];
+  const vals = regionValues(q);
+  if(vals.length < 2){
+    ctx.fillStyle = "#6b7488";
+    ctx.fillText("Not enough sources in region.", 20, 40);
+    return;
+  }
+  const s = Float64Array.from(vals).sort();
+  // robust display range: 0.5–99.5 pct padded
+  let lo = s[Math.floor(0.005*(s.length-1))], hi = s[Math.ceil(0.995*(s.length-1))];
+  if(q === "rm"){ const m = Math.max(Math.abs(lo), Math.abs(hi)); lo = -m; hi = m; }
+  if(lo === hi){ lo -= 1; hi += 1; }
+  const pad = 0.04*(hi - lo);
+  lo -= pad; hi += pad;
+  const nb = histState.nbins;
+  const counts = new Float64Array(nb);
+  let inRange = 0;
+  for(const v of vals){
+    const t = (v - lo)/(hi - lo);
+    if(t >= 0 && t < 1){ counts[Math.floor(t*nb)]++; inRange++; }
+  }
+  const maxC = Math.max(...counts, 1);
+  const ml = 52, mr = 14, mt = 12, mb = 38;
+  const pw = W - ml - mr, ph = H - mt - mb;
+  const yOf = c => {
+    if(histState.logy) return mt + ph*(1 - Math.log10(1 + c)/Math.log10(1 + maxC));
+    return mt + ph*(1 - c/maxC);
+  };
+  // grid + axes (recessive)
+  ctx.strokeStyle = "#242b3a"; ctx.lineWidth = 1;
+  ctx.font = "10px ui-monospace, Menlo, monospace";
+  ctx.fillStyle = "#9aa3b5";
+  const yticks = histState.logy
+      ? Array.from({length: Math.floor(Math.log10(maxC)) + 1}, (_, i) => Math.pow(10, i))
+      : niceTicks(0, maxC, false);
+  ctx.textAlign = "right";
+  for(const yt of yticks){
+    const y = yOf(yt);
+    if(y < mt - 2) continue;
+    ctx.beginPath(); ctx.moveTo(ml, y); ctx.lineTo(W - mr, y); ctx.stroke();
+    ctx.fillText(yt >= 1000 ? yt.toExponential(0) : String(Math.round(yt)), ml - 6, y + 3);
+  }
+  // bars
+  ctx.fillStyle = "#4f8cff";
+  const bw = pw/nb;
+  for(let i=0;i<nb;i++){
+    if(!counts[i]) continue;
+    const y = yOf(counts[i]);
+    ctx.fillRect(ml + i*bw + 0.5, y, Math.max(1, bw - 1), mt + ph - y);
+  }
+  // median + zero markers
+  const st = robustStats(vals);
+  ctx.strokeStyle = "#e0a33b"; ctx.setLineDash([4, 3]);
+  const xm = ml + (st.median - lo)/(hi - lo)*pw;
+  if(xm > ml && xm < W - mr){
+    ctx.beginPath(); ctx.moveTo(xm, mt); ctx.lineTo(xm, mt + ph); ctx.stroke();
+    ctx.fillStyle = "#e0a33b"; ctx.textAlign = "left";
+    ctx.fillText("median " + fmt(st.median, Q.dec), Math.min(xm + 5, W - 120), mt + 12);
+  }
+  if(lo < 0 && hi > 0){
+    ctx.strokeStyle = "#6b7488";
+    const x0 = ml + (0 - lo)/(hi - lo)*pw;
+    ctx.beginPath(); ctx.moveTo(x0, mt); ctx.lineTo(x0, mt + ph); ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  // x axis
+  ctx.strokeStyle = "#3a4358";
+  ctx.beginPath(); ctx.moveTo(ml, mt + ph); ctx.lineTo(W - mr, mt + ph); ctx.stroke();
+  ctx.fillStyle = "#9aa3b5"; ctx.textAlign = "center";
+  for(const xt of niceTicks(lo, hi, false)){
+    const x = ml + (xt - lo)/(hi - lo)*pw;
+    ctx.fillText(fmt(xt, Math.abs(hi - lo) > 20 ? 0 : Q.dec), x, mt + ph + 14);
+  }
+  ctx.fillStyle = "#e8ebf2";
+  ctx.font = "11.5px -apple-system, 'Segoe UI', sans-serif";
+  ctx.fillText(Q.label + (Q.unit ? " / " + Q.unit : "") +
+      `   (${inRange.toLocaleString()} of ${vals.length.toLocaleString()} in range)`, ml + pw/2, H - 6);
+}
+function exportHistPNG(){
+  const cv = $("histcanvas");
+  const out = document.createElement("canvas");
+  out.width = cv.width; out.height = cv.height + 30*2;
+  const ctx = out.getContext("2d");
+  ctx.fillStyle = "#0b0e14";
+  ctx.fillRect(0, 0, out.width, out.height);
+  ctx.drawImage(cv, 0, 30);
+  ctx.fillStyle = "#e8ebf2";
+  ctx.font = (13*2) + "px -apple-system, sans-serif";
+  ctx.fillText(`POSSUM DR1 region: l=${REGION.l.toFixed(2)}° b=${REGION.b.toFixed(2)}° r=${REGION.radius.toFixed(2)}°`, 20, 42);
+  out.toBlob(b => download(b, `possum_region_l${REGION.l.toFixed(1)}_b${REGION.b.toFixed(1)}_r${REGION.radius.toFixed(1)}_hist.png`));
+}
+function renderRegionTable(){
+  const V = {rm: getValues("rm"), rm_err: getValues("rm_err"), polint: getValues("polint"),
+             fracpol: getValues("fracpol"), snr: getValues("snr")};
+  let html = "<tr><th>id</th><th>cat</th><th>sep°</th><th>l°</th><th>b°</th><th>RM</th><th>σRM</th><th>PI mJy</th><th>p %</th><th>S/N</th></tr>";
+  const nShow = Math.min(300, REGION.sIdx.length);
+  for(let k = 0; k < nShow; k++){
+    const i = REGION.sIdx[k];
+    html += `<tr><td>${catId(i)}</td><td>${DATA.cat[i] ? "SR" : "P"}</td><td>${REGION.sSep[k].toFixed(3)}</td>` +
+        `<td>${DATA.l[i].toFixed(3)}</td><td>${DATA.b[i].toFixed(3)}</td>` +
+        `<td>${V.rm[i].toFixed(1)}</td><td>${V.rm_err[i].toFixed(2)}</td>` +
+        `<td>${V.polint[i].toFixed(2)}</td><td>${V.fracpol[i].toFixed(2)}</td><td>${V.snr[i].toFixed(1)}</td></tr>`;
+  }
+  $("regtable").innerHTML = html;
+}
+function exportRegionCSV(){
+  if(!REGION.idx || !REGION.idx.length){ alert("No region defined."); return; }
+  const cols = ["id", "catalogue", "sep_deg", "ra_deg", "dec_deg", "l_deg", "b_deg",
+      "rm_radm2", "rm_err_radm2", "polint_mJy", "fracpol_pct", "snr_pi", "stokesI_mJy",
+      "spectral_index", "polangle0_deg"];
+  const V = {rm: getValues("rm"), rm_err: getValues("rm_err"), polint: getValues("polint"),
+             fracpol: getValues("fracpol"), snr: getValues("snr"), stokesI: getValues("stokesI"),
+             spidx: getValues("spidx"), polang: getValues("polang")};
+  let buf = "# POSSUM DR1 Sky Explorer region export\n" +
+      `# centre_gal_deg = ${REGION.l.toFixed(5)}, ${REGION.b.toFixed(5)}\n` +
+      `# radius_deg = ${REGION.radius.toFixed(4)}\n` +
+      `# filters_default = ${filterIsDefault()}\n` +
+      cols.join(",") + "\n";
+  const order = Array.from(REGION.idx.keys()).sort((a, b) => REGION.sep[a] - REGION.sep[b]);
+  for(const k of order){
+    const i = REGION.idx[k];
+    const [ra, dec] = galToEq(DATA.l[i], DATA.b[i]);
+    buf += catId(i) + "," + catName(i) + "," + REGION.sep[k].toFixed(4) + "," +
+        ra.toFixed(5) + "," + dec.toFixed(5) + "," +
+        DATA.l[i].toFixed(5) + "," + DATA.b[i].toFixed(5) + "," +
+        V.rm[i].toFixed(3) + "," + V.rm_err[i].toFixed(4) + "," +
+        V.polint[i].toFixed(4) + "," + V.fracpol[i].toFixed(3) + "," +
+        V.snr[i].toFixed(2) + "," + V.stokesI[i].toFixed(4) + "," +
+        V.spidx[i].toFixed(3) + "," + V.polang[i].toFixed(2) + "\n";
+  }
+  download(new Blob([buf], {type: "text/csv"}),
+      `possum_region_l${REGION.l.toFixed(1)}_b${REGION.b.toFixed(1)}_r${REGION.radius.toFixed(1)}deg_${REGION.idx.length}rows.csv`);
+}
+
+/* ---------- region cutout map ---------------------------------------------- */
+function safeDraw(fn){          // one broken panel must never blank the others
+  try{ fn(); }catch(err){ console.warn("panel draw failed:", fn.name, err); }
+}
+const CUT = {map:null, box:null, token:0, filterGen:-1};
+function cutoutSpans(){
+  // hDeg/wDeg are TRUE (great-circle) degrees; lonSpan is the longitude range that
+  // subtends wDeg true degrees at the region's latitude (cos b correction), so the
+  // panel is locally conformal and the region circle draws round.
+  const hDeg = clamp(4*REGION.radius, 1, 70);
+  const wDeg = hDeg*3.2;
+  const cosb = Math.max(0.15, Math.cos(REGION.b*D2R));
+  return {hDeg, wDeg, lonSpan: Math.min(356, wDeg/cosb)};
+}
+function cutoutValid(){
+  if(!CUT.map || CUT.filterGen !== filterGen) return false;
+  const {hDeg, lonSpan} = cutoutSpans();
+  const dl = Math.abs(((REGION.l - CUT.centerL + 540) % 360) - 180);
+  const db = Math.abs(REGION.b - CUT.centerB);
+  return lonSpan <= CUT.box.dlon*0.96 && hDeg <= CUT.box.dlat*0.96 &&
+         dl < CUT.box.dlon*0.16 && db < CUT.box.dlat*0.16;
+}
+async function ensureCutout(force){
+  if(!REGION.active) return;
+  if(!force && cutoutValid()) return;
+  if(VIEW.dataset === "blink") return;        // blink: cutout samples the phase map instead
+  const {hDeg, wDeg, lonSpan} = cutoutSpans();
+  const cw = Math.min(358, lonSpan*1.5);          // cache window, longitude degrees
+  const ch = Math.min(178, hDeg*1.5);
+  const lat0 = clamp(REGION.b - ch/2, -90, 90), lat1 = clamp(REGION.b + ch/2, -90, 90);
+  const lon0 = ((REGION.l - cw/2) % 360 + 360) % 360;
+  const t = ++CUT.token;
+  const cosb = Math.max(0.15, Math.cos(REGION.b*D2R));
+  const W = 1536, H = Math.max(96, Math.round(1536*(lat1 - lat0)/(cw*cosb)));
+  try{
+    const r = await workerCall({type:"tess", W, H: Math.min(H, 1024),
+        lon0, lon1: lon0 + cw, lat0, lat1, maxSep: VIEW.maxsep});
+    if(t !== CUT.token) return;
+    CUT.map = r.idxMap;
+    CUT.box = {lon0, dlon: cw, lat0, dlat: lat1 - lat0, W: r.W, H: r.H};
+    CUT.centerL = REGION.l; CUT.centerB = REGION.b;
+    CUT.filterGen = filterGen;
+    drawCutout();
+  }catch(e){}
+}
+function cutoutSample(lon, lat){
+  // returns source index or 0xFFFFFFFF; prefers the dedicated cutout map
+  if(CUT.map && CUT.filterGen === filterGen){
+    const rl = ((lon - CUT.box.lon0) % 360 + 360) % 360;
+    if(rl <= CUT.box.dlon && lat >= CUT.box.lat0 && lat <= CUT.box.lat0 + CUT.box.dlat){
+      const x = Math.min(CUT.box.W - 1, Math.floor(rl/CUT.box.dlon*CUT.box.W));
+      const y = Math.min(CUT.box.H - 1, Math.floor((lat - CUT.box.lat0)/CUT.box.dlat*CUT.box.H));
+      return CUT.map[y*CUT.box.W + x];
+    }
+  }
+  return valueAtPixel(lon, lat);   // fall back to the global map
+}
+function drawCutout(){
+  const cv = $("cutcanvas");
+  if(!cv || !REGION.active) return;
+  const {hDeg, wDeg, lonSpan} = cutoutSpans();
+  const cWi = 1152, cHi = Math.round(cWi/3.2);   // internal raster, matches CSS aspect-ratio
+  cv.width = cWi; cv.height = cHi;
+  const ctx = cv.getContext("2d");
+  const img = ctx.createImageData(cWi, cHi);
+  const d = img.data;
+  const lut = LUTS[VIEW.cmap] || LUTS.viridis;
+  const f = stretchFn();
+  const th = THEMES[VIEW.theme];
+  const blank = [Math.round(th.blank[0]*255), Math.round(th.blank[1]*255), Math.round(th.blank[2]*255)];
+  const bg = [13, 16, 23];
+  const vals = getValues(VIEW.quantity);
+  for(let y = 0; y < cHi; y++){
+    const lat = REGION.b + hDeg*(0.5 - (y + 0.5)/cHi);
+    for(let x = 0; x < cWi; x++){
+      const lon = REGION.l + lonSpan*(0.5 - (x + 0.5)/cWi);   // l increases leftward; cos b corrected
+      const o = 4*(y*cWi + x);
+      let c;
+      if(Math.abs(lat) > 90) c = bg;
+      else{
+        const s = cutoutSample(((lon % 360) + 360) % 360, lat);
+        if(s === 0xFFFFFFFF) c = blank;
+        else{
+          let t = f(vals[s]);
+          if(!isFinite(t)) c = blank;          // NaN-valued source (rare SR rows)
+          else{
+            if(VIEW.cmapFlip) t = 1 - t;
+            c = lut[Math.round(clamp(t, 0, 1)*255)] || blank;
+          }
+        }
+      }
+      d[o] = c[0]; d[o + 1] = c[1]; d[o + 2] = c[2]; d[o + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  // graticule ticks
+  const px = v => (0.5 - v/lonSpan)*cWi;  // v = wrapped (lon - centre), longitude degrees
+  const py = v => (0.5 - v/hDeg)*cHi;     // v = lat - centre
+  ctx.font = "16px ui-monospace, Menlo, monospace";
+  ctx.fillStyle = "rgba(230,235,245,0.85)";
+  ctx.strokeStyle = "rgba(160,170,190,0.28)";
+  ctx.lineWidth = 1;
+  const gstepArr = [0.2, 0.5, 1, 2, 5, 10, 15, 30, 45];
+  const gs = gstepArr.find(s => lonSpan/s <= 9) || 60;
+  ctx.textAlign = "center";
+  for(let L = Math.ceil((REGION.l - lonSpan/2)/gs)*gs; L <= REGION.l + lonSpan/2; L += gs){
+    const x = px(((L - REGION.l + 540) % 360) - 180);
+    if(x < 20 || x > cWi - 20) continue;
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, cHi); ctx.stroke();
+    ctx.fillText((((L % 360) + 360) % 360).toFixed(gs < 1 ? 1 : 0) + "°", x, cHi - 8);
+  }
+  const gsb = gstepArr.find(s => hDeg/s <= 5) || 30;
+  ctx.textAlign = "left";
+  for(let B = Math.ceil((REGION.b - hDeg/2)/gsb)*gsb; B <= REGION.b + hDeg/2; B += gsb){
+    const y = py(B - REGION.b);
+    if(y < 14 || y > cHi - 24) continue;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(cWi, y); ctx.stroke();
+    ctx.fillText((B > 0 ? "+" : "") + B.toFixed(gsb < 1 ? 1 : 0) + "°", 6, y - 4);
+  }
+  // region circle + centre
+  ctx.strokeStyle = "#38ff6e"; ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  const c = uvec(REGION.l, REGION.b);
+  let a = Math.abs(c[2]) < 0.9 ? [0,0,1] : [1,0,0];
+  let u = [c[1]*a[2]-c[2]*a[1], c[2]*a[0]-c[0]*a[2], c[0]*a[1]-c[1]*a[0]];
+  const nu = Math.hypot(u[0], u[1], u[2]); u = [u[0]/nu, u[1]/nu, u[2]/nu];
+  const w2 = [c[1]*u[2]-c[2]*u[1], c[2]*u[0]-c[0]*u[2], c[0]*u[1]-c[1]*u[0]];
+  const cr = Math.cos(REGION.radius*D2R), sr = Math.sin(REGION.radius*D2R);
+  for(let s = 0; s <= 200; s++){
+    const ph = 2*Math.PI*s/200;
+    const vx = cr*c[0] + sr*(Math.cos(ph)*u[0] + Math.sin(ph)*w2[0]);
+    const vy = cr*c[1] + sr*(Math.cos(ph)*u[1] + Math.sin(ph)*w2[1]);
+    const vz = cr*c[2] + sr*(Math.cos(ph)*u[2] + Math.sin(ph)*w2[2]);
+    const ll = lonlat([vx, vy, vz]);
+    const x = px((((ll[0] - REGION.l) + 540) % 360) - 180), y = py(ll[1] - REGION.b);
+    s === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+  ctx.lineWidth = 2;
+  const cx = cWi/2, cy = cHi/2;
+  ctx.beginPath();
+  ctx.moveTo(cx - 7, cy - 7); ctx.lineTo(cx + 7, cy + 7);
+  ctx.moveTo(cx - 7, cy + 7); ctx.lineTo(cx + 7, cy - 7);
+  ctx.stroke();
+}
+
+/* ---------- region nudging -------------------------------------------------- */
+let nudgeStreak = 0;
+const cutoutRetessDebounced = debounce(() => ensureCutout(false), 380);
+const tableUpdateDebounced = debounce(() => { if($("regtable")) renderRegionTable(); }, 320);
+function nudgeRegion(e){
+  nudgeStreak = e.repeat ? nudgeStreak + 1 : 0;
+  const acc = Math.min(6, 1 + nudgeStreak*0.16);
+  const stepB = Math.max(0.01, REGION.radius*0.05)*acc;
+  const stepL = stepB/Math.max(0.2, Math.cos(REGION.b*D2R));
+  if(e.key === "ArrowLeft") REGION.l = ((REGION.l + stepL) % 360 + 360) % 360;
+  else if(e.key === "ArrowRight") REGION.l = ((REGION.l - stepL) % 360 + 360) % 360;
+  else if(e.key === "ArrowUp") REGION.b = clamp(REGION.b + stepB, -89.5, 89.5);
+  else if(e.key === "ArrowDown") REGION.b = clamp(REGION.b - stepB, -89.5, 89.5);
+  else if(e.key === "+" || e.key === "=") REGION.radius = Math.min(20, REGION.radius*1.06);
+  else if(e.key === "-" || e.key === "_") REGION.radius = Math.max(0.05, REGION.radius/1.06);
+  regionNudged();
+}
+function regionNudged(){
+  setRegionMembers(regionMembers());
+  const [cra, cdec] = galToEq(REGION.l, REGION.b);
+  if($("rt-centre")){
+    $("rt-centre").innerHTML = `l=${REGION.l.toFixed(3)}°, b=${REGION.b.toFixed(3)}°
+      (α=${cra.toFixed(3)}°, δ=${cdec.toFixed(3)}°)`;
+    $("rt-rad").textContent = REGION.radius.toFixed(2) + "°";
+    $("rt-area").textContent = (2*Math.PI*(1 - Math.cos(REGION.radius*D2R))*(R2D*R2D)).toFixed(1);
+    safeDraw(renderRegionStats);
+    safeDraw(drawHistogram);
+    safeDraw(drawProfile);
+    safeDraw(drawCutout);
+    cutoutRetessDebounced();
+    tableUpdateDebounced();
+  }
+  requestRender();
+}
+
+/* ---------- RM vs separation profile ---------------------------------------- */
+let profState = {win: null, bin: 0.5, resid: false,
+                 show: {scatter: true, mad: true, sigma: true, med: true}};
+function buildProfileControls(){
+  const chipsHost = $("prof-chips");
+  const chips = [
+    ["scatter", "sources", "#9ec4ff"],
+    ["mad", "windowed σ (1.4826×MAD)", "#38ff6e"],
+    ["sigma", "windowed σ (std dev)", "#e0a33b"],
+    ["med", "binned medians", "#ffffff"],
+  ];
+  chipsHost.innerHTML = chips.map(c =>
+    `<label><input type="checkbox" data-chip="${c[0]}" ${profState.show[c[0]] ? "checked" : ""}>
+     <span class="csw" style="background:${c[2]}"></span>${c[1]}</label>`).join("") +
+    `<label title="subtract the sliding-window running median from every source — a coarse residual RM">
+     <input type="checkbox" id="prof-resid" ${profState.resid ? "checked" : ""}>
+     <span class="csw" style="background:#b48ef0"></span>− running median (residual RM)</label>`;
+  chipsHost.querySelectorAll("input[data-chip]").forEach(cb => cb.onchange = () => {
+    profState.show[cb.dataset.chip] = cb.checked;
+    drawProfile();
+  });
+  $("prof-resid").onchange = e => { profState.resid = e.target.checked; drawProfile(); };
+  if(!profState.win) profState.win = Math.max(0.2, +(REGION.radius/6).toFixed(2));
+  const wEl = document.createElement("div");
+  $("prof-win").replaceWith(wEl);
+  dualSlider(wEl, {label: "sliding window / °", min: 0.05, max: Math.max(5, REGION.radius/2),
+      lo: profState.win, dec: 2, single: true, log: true,
+      onChange: debounce(v => { profState.win = v; drawProfile(); }, 80)});
+  const bEl = document.createElement("div");
+  $("prof-bin").replaceWith(bEl);
+  dualSlider(bEl, {label: "median bin / °", min: 0.1, max: Math.max(5, REGION.radius/2),
+      lo: profState.bin, dec: 2, single: true, log: true,
+      onChange: debounce(v => { profState.bin = v; drawProfile(); }, 80)});
+  $("prof-png").onclick = exportProfilePNG;
+}
+function sliceStats(k0, k1){
+  // stats of sorted-region members [k0,k1): O(1) mean/std via prefix sums, sampled median/MAD
+  const n = REGION.pCnt[k1] - REGION.pCnt[k0];     // finite-RM members only
+  if(n < 8) return null;
+  const sum = REGION.pSum[k1] - REGION.pSum[k0];
+  const sum2 = REGION.pSum2[k1] - REGION.pSum2[k0];
+  const mean = sum/n;
+  const varr = Math.max(0, (sum2 - n*mean*mean)/(n - 1));
+  const std = Math.sqrt(varr);
+  const step = Math.max(1, Math.floor((k1 - k0)/3000));
+  const s = [];
+  for(let k = k0; k < k1; k += step){ const v = REGION.sRM[k]; if(isFinite(v)) s.push(v); }
+  if(s.length < 4) return null;
+  s.sort((a, b) => a - b);
+  const med = s[(s.length - 1) >> 1];
+  const ad = s.map(v => Math.abs(v - med)).sort((a, b) => a - b);
+  const madStd = 1.4826*ad[(ad.length - 1) >> 1];
+  return {n, mean, std, med, madStd};
+}
+function sepRange(t0, t1){
+  // binary search in REGION.sSep
+  const S = REGION.sSep, n = S.length;
+  let lo = 0, hi = n;
+  while(lo < hi){ const m = (lo + hi) >> 1; if(S[m] < t0) lo = m + 1; else hi = m; }
+  const k0 = lo; hi = n;
+  while(lo < hi){ const m = (lo + hi) >> 1; if(S[m] < t1) lo = m + 1; else hi = m; }
+  return [k0, lo];
+}
+function drawProfile(){
+  const cv = $("profcanvas");
+  if(!cv || !REGION.sIdx) return;
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const W = cv.clientWidth || 900, H = 340;
+  cv.width = W*dpr; cv.height = H*dpr;
+  const ctx = cv.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, W, H);
+  const n = REGION.sIdx.length;
+  if(n < 8){ ctx.fillStyle = "#6b7488"; ctx.fillText("Not enough sources.", 20, 40); return; }
+  const R = REGION.radius;
+  const w = profState.win || Math.max(0.2, R/6);
+  // windowed curves at 90 eval points
+  const NE = 90;
+  const curves = [];
+  for(let e = 0; e <= NE; e++){
+    const th = R*e/NE;
+    const [k0, k1] = sepRange(Math.max(0, th - w/2), Math.min(R, th + w/2));
+    const st = sliceStats(k0, k1);
+    curves.push(st ? {th, med: st.med, mad: st.madStd, seMad: 1.166*st.madStd/Math.sqrt(st.n),
+                      sig: st.std, seSig: st.std/Math.sqrt(2*(st.n - 1))} : null);
+  }
+  // running-median interpolator (for the residual option)
+  const medPts = curves.filter(Boolean);
+  function medAt(th){
+    if(!medPts.length) return 0;
+    if(th <= medPts[0].th) return medPts[0].med;
+    if(th >= medPts[medPts.length - 1].th) return medPts[medPts.length - 1].med;
+    let lo = 0, hi = medPts.length - 1;
+    while(hi - lo > 1){ const m = (lo + hi) >> 1; medPts[m].th <= th ? lo = m : hi = m; }
+    const a = medPts[lo], b = medPts[hi];
+    return a.med + (b.med - a.med)*(th - a.th)/Math.max(1e-9, b.th - a.th);
+  }
+  const resid = profState.resid;
+  const yval = k => resid ? REGION.sRM[k] - medAt(REGION.sSep[k]) : REGION.sRM[k];
+  // binned medians (of residuals when the residual option is on)
+  const bins = [];
+  for(let t0 = 0; t0 < R; t0 += profState.bin){
+    const [k0, k1] = sepRange(t0, Math.min(R, t0 + profState.bin));
+    const st = sliceStats(k0, k1);
+    if(st){
+      const th = t0 + Math.min(profState.bin, R - t0)/2;
+      bins.push({th, med: resid ? st.med - medAt(th) : st.med,
+                 err: 1.253*st.madStd/Math.sqrt(st.n)});
+    }
+  }
+  // y range: robust from the plotted values and curves
+  const step = Math.max(1, Math.floor(n/20000));
+  const absSample = [];
+  for(let k = 0; k < n; k += step){
+    const v = yval(k);
+    if(isFinite(v)) absSample.push(Math.abs(v));
+  }
+  absSample.sort((a, b) => a - b);
+  let Y = (absSample[Math.floor(0.985*(absSample.length - 1))] || 5)*1.15;
+  for(const c of curves) if(c) Y = Math.max(Y, (c.mad + c.seMad)*1.25, (c.sig + c.seSig)*1.1);
+  Y = Math.max(Y, 5);
+  const ml = 56, mr = 14, mt = 12, mb = 40;
+  const pw = W - ml - mr, ph = H - mt - mb;
+  const X = t => ml + t/R*pw;
+  const Yp = v => mt + ph*(1 - (v + Y)/(2*Y));
+  // grid
+  ctx.strokeStyle = "#242b3a"; ctx.lineWidth = 1;
+  ctx.font = "10px ui-monospace, Menlo, monospace"; ctx.fillStyle = "#9aa3b5";
+  ctx.textAlign = "right";
+  for(const yt of niceTicks(-Y, Y, false)){
+    const y = Yp(yt);
+    ctx.beginPath(); ctx.moveTo(ml, y); ctx.lineTo(W - mr, y); ctx.stroke();
+    ctx.fillText(fmt(yt, Y > 50 ? 0 : 1), ml - 6, y + 3);
+  }
+  ctx.strokeStyle = "#3a4358";
+  ctx.beginPath(); ctx.moveTo(ml, Yp(0)); ctx.lineTo(W - mr, Yp(0)); ctx.stroke();
+  ctx.textAlign = "center";
+  for(const xt of niceTicks(0, R, false)){
+    if(xt < 0) continue;
+    ctx.fillText(fmt(xt, R > 5 ? 0 : 1) + "°", X(xt), mt + ph + 14);
+  }
+  // scatter (bright enough to read against the dark panel)
+  if(profState.show.scatter){
+    for(let k = 0; k < n; k += Math.max(1, Math.floor(n/25000))){
+      const v = yval(k);
+      if(!isFinite(v)) continue;
+      const x = X(REGION.sSep[k]), y = Yp(clamp(v, -Y, Y));
+      ctx.fillStyle = REGION.sCat[k] ? "rgba(255,168,218,0.6)" : "rgba(158,196,255,0.55)";
+      ctx.fillRect(x - 1.3, y - 1.3, 2.6, 2.6);
+    }
+  }
+  function band(getV, getSE, color){
+    ctx.beginPath();
+    let started = false;
+    for(const c of curves){ if(!c) continue;
+      const y = Yp(clamp(getV(c) + getSE(c), -Y, Y));
+      started ? ctx.lineTo(X(c.th), y) : ctx.moveTo(X(c.th), y); started = true; }
+    for(let i = curves.length - 1; i >= 0; i--){ const c = curves[i]; if(!c) continue;
+      ctx.lineTo(X(c.th), Yp(clamp(getV(c) - getSE(c), -Y, Y))); }
+    ctx.closePath();
+    ctx.fillStyle = color; ctx.fill();
+  }
+  function line(getV, color){
+    ctx.beginPath();
+    let started = false;
+    for(const c of curves){ if(!c) continue;
+      const y = Yp(clamp(getV(c), -Y, Y));
+      started ? ctx.lineTo(X(c.th), y) : ctx.moveTo(X(c.th), y); started = true; }
+    ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.stroke();
+  }
+  if(profState.show.sigma){ band(c => c.sig, c => c.seSig, "rgba(224,163,59,0.16)"); line(c => c.sig, "#e0a33b"); }
+  if(profState.show.mad){ band(c => c.mad, c => c.seMad, "rgba(56,255,110,0.14)"); line(c => c.mad, "#38ff6e"); }
+  if(profState.show.med){
+    ctx.strokeStyle = "#ffffff"; ctx.fillStyle = "#ffffff"; ctx.lineWidth = 1.4;
+    for(const b of bins){
+      const x = X(b.th), y = Yp(clamp(b.med, -Y, Y));
+      const y0 = Yp(clamp(b.med - b.err, -Y, Y)), y1 = Yp(clamp(b.med + b.err, -Y, Y));
+      ctx.beginPath(); ctx.moveTo(x, y0); ctx.lineTo(x, y1); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x - 3, y0); ctx.lineTo(x + 3, y0); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x - 3, y1); ctx.lineTo(x + 3, y1); ctx.stroke();
+      ctx.beginPath(); ctx.arc(x, y, 2.6, 0, 2*Math.PI); ctx.fill();
+    }
+  }
+  // direct labels at right end
+  ctx.font = "10.5px -apple-system,'Segoe UI',sans-serif"; ctx.textAlign = "left";
+  const lastC = curves.filter(Boolean).slice(-1)[0];
+  if(lastC){
+    if(profState.show.mad){ ctx.fillStyle = "#38ff6e"; ctx.fillText("σ_MAD", X(lastC.th) - 34, Yp(lastC.mad) - 6); }
+    if(profState.show.sigma){ ctx.fillStyle = "#e0a33b"; ctx.fillText("σ", X(lastC.th) - 12, Yp(lastC.sig) - 6); }
+  }
+  ctx.fillStyle = "#e8ebf2"; ctx.textAlign = "center";
+  ctx.font = "11.5px -apple-system,'Segoe UI',sans-serif";
+  ctx.fillText("separation from region centre / °   (window " + fmt(w, 2) + "°, bins " +
+      fmt(profState.bin, 2) + "°, N=" + n.toLocaleString() +
+      (resid ? ", running median subtracted" : "") + ")", ml + pw/2, H - 6);
+  ctx.save(); ctx.translate(12, mt + ph/2); ctx.rotate(-Math.PI/2);
+  ctx.fillText(resid ? "RM − running median / rad m⁻²" : "RM / rad m⁻²", 0, 0); ctx.restore();
+}
+function exportProfilePNG(){
+  const cv = $("profcanvas");
+  const out = document.createElement("canvas");
+  out.width = cv.width; out.height = cv.height + 60;
+  const ctx = out.getContext("2d");
+  ctx.fillStyle = "#0b0e14"; ctx.fillRect(0, 0, out.width, out.height);
+  ctx.drawImage(cv, 0, 60);
+  ctx.fillStyle = "#e8ebf2"; ctx.font = "26px -apple-system,sans-serif";
+  ctx.fillText(`POSSUM region RM profile: l=${REGION.l.toFixed(2)}° b=${REGION.b.toFixed(2)}° r=${REGION.radius.toFixed(2)}°`, 20, 40);
+  out.toBlob(b => download(b, `possum_region_l${REGION.l.toFixed(1)}_b${REGION.b.toFixed(1)}_profile.png`));
+}
+
+/* ---------- Aladin / DS9 region export -------------------------------------- */
+const DS9 = {
+  circles: true, sticksE: false, sticksB: false, marks: true, outline: true,
+  labels: false, dashSR: true,
+  scale: "sqrt",          // linear | sqrt (area ∝ |RM|) | square
+  maxRad: 60,             // arcsec at the reference |RM|
+  refRM: null,            // rad/m2; default = region p98 |RM|
+  minRad: 2,
+  stickBy: "fracpol",     // fracpol | polint | fixed
+  stickLen: 90,           // arcsec at the reference value
+  refP: null, refPI: null,
+  limit: 20000,
+};
+function regionPct(getv, p){
+  const n = REGION.sIdx.length, step = Math.max(1, Math.floor(n/40000));
+  const s = [];
+  for(let k = 0; k < n; k += step){ const v = getv(k); if(isFinite(v)) s.push(v); }
+  if(!s.length) return 1;
+  s.sort((a, b) => a - b);
+  return s[Math.min(s.length - 1, Math.round(p/100*(s.length - 1)))];
+}
+function niceRound(v){
+  if(!isFinite(v) || v <= 0) return 1;
+  const e = Math.pow(10, Math.floor(Math.log10(v)));
+  const m = v/e;
+  return (m < 1.5 ? 1 : m < 3.5 ? 2 : m < 7.5 ? 5 : 10)*e;
+}
+function ds9SelectedSources(){
+  // sorted by descending polint, capped at DS9.limit, NaN positions skipped
+  const pi = getValues("polint");
+  const order = Array.from(REGION.sIdx.keys()).sort((a, b) =>
+      pi[REGION.sIdx[b]] - pi[REGION.sIdx[a]]);
+  return order.slice(0, Math.max(1, Math.min(DS9.limit, order.length)));
+}
+function ds9RadiusArcsec(rm){
+  const ref = Math.max(1e-3, DS9.refRM);
+  const x = Math.min(3, Math.abs(rm)/ref);          // cap 3x reference
+  const f = DS9.scale === "linear" ? x : DS9.scale === "square" ? x*x : Math.sqrt(x);
+  return Math.max(DS9.minRad, DS9.maxRad*f);
+}
+function ds9StickArcsec(k){
+  if(DS9.stickBy === "fixed") return DS9.stickLen;
+  const i = REGION.sIdx[k];
+  const v = DS9.stickBy === "polint" ? getValues("polint")[i] : getValues("fracpol")[i];
+  const ref = DS9.stickBy === "polint" ? Math.max(1e-6, DS9.refPI) : Math.max(1e-6, DS9.refP);
+  return Math.max(4, DS9.stickLen*Math.min(2.5, v/ref));
+}
+function ds9StickEnds(i, k, rot90){
+  // endpoints of a stick centred on the source, PA east of north (equatorial)
+  const [ra, dec] = galToEq(DATA.l[i], DATA.b[i]);
+  let pa = getValues("polang")[i];
+  if(!isFinite(pa)) return null;
+  if(rot90) pa += 90;
+  const half = ds9StickArcsec(k)/3600/2;             // deg
+  const dDec = half*Math.cos(pa*D2R);
+  const dRA = half*Math.sin(pa*D2R)/Math.max(0.05, Math.cos(dec*D2R));
+  return [ra - dRA, dec - dDec, ra + dRA, dec + dDec];
+}
+function buildDs9(){
+  const rm = getValues("rm");
+  const sel = ds9SelectedSources();
+  const lines = [];
+  lines.push("# Region file format: DS9 version 4.1");
+  lines.push(`# POSSUM DR1 Sky Explorer region export ${new Date().toISOString().slice(0,10)}`);
+  lines.push(`# centre (gal): l=${REGION.l.toFixed(5)} b=${REGION.b.toFixed(5)}  radius=${REGION.radius.toFixed(4)} deg`);
+  lines.push(`# sources: ${sel.length}${sel.length < REGION.sIdx.length ? " of " + REGION.sIdx.length + " (capped, brightest PI first)" : ""}; filters_default=${filterIsDefault()}`);
+  if(DS9.circles) lines.push(`# RM circles: radius = ${DS9.maxRad}" x ${DS9.scale === "linear" ? "(|RM|/ref)" : DS9.scale === "square" ? "(|RM|/ref)^2" : "sqrt(|RM|/ref)"} at ref |RM| = ${DS9.refRM} rad/m2 (capped 3x ref); red = RM>0, blue = RM<0`);
+  if(DS9.sticksE || DS9.sticksB) lines.push(`# sticks: length = ${DS9.stickLen}" at ref ${DS9.stickBy === "fixed" ? "(fixed)" : DS9.stickBy + " = " + (DS9.stickBy === "polint" ? DS9.refPI + " mJy" : DS9.refP + " %")}; PA east of north${DS9.sticksB ? "; B = E-vector + 90 deg" : ""}`);
+  lines.push("global color=green dashlist=8 3 width=1 font=\"helvetica 10 normal roman\" select=1 highlite=1 dash=0 fixed=0 edit=1 move=0 delete=1 include=1 source=1");
+  lines.push("fk5");
+  if(DS9.outline){
+    const [cra, cdec] = galToEq(REGION.l, REGION.b);
+    lines.push(`circle(${cra.toFixed(6)},${cdec.toFixed(6)},${(REGION.radius*3600).toFixed(1)}") # color=green dash=1 width=2 text={region}`);
+  }
+  for(const k of sel){
+    const i = REGION.sIdx[k];
+    const [ra, dec] = galToEq(DATA.l[i], DATA.b[i]);
+    const raS = ra.toFixed(6), decS = dec.toFixed(6);
+    const isSR = DATA.cat[i] === 1;
+    const dash = (DS9.dashSR && isSR) ? " dash=1" : "";
+    const label = DS9.labels ? ` text={${catId(i)}}` : "";
+    if(DS9.circles && isFinite(rm[i])){
+      const col = rm[i] >= 0 ? "red" : "blue";
+      lines.push(`circle(${raS},${decS},${ds9RadiusArcsec(rm[i]).toFixed(1)}") # color=${col} fill=0${dash}${label}`);
+    }
+    if(DS9.sticksE){
+      const e = ds9StickEnds(i, k, false);
+      if(e) lines.push(`line(${e[0].toFixed(6)},${e[1].toFixed(6)},${e[2].toFixed(6)},${e[3].toFixed(6)}) # line=0 0 color=yellow width=2${dash}`);
+    }
+    if(DS9.sticksB){
+      const e = ds9StickEnds(i, k, true);
+      if(e) lines.push(`line(${e[0].toFixed(6)},${e[1].toFixed(6)},${e[2].toFixed(6)},${e[3].toFixed(6)}) # line=0 0 color=cyan width=2${dash}`);
+    }
+    if(DS9.marks)
+      lines.push(`point(${raS},${decS}) # point=x 5 color=white${label && !DS9.circles && !DS9.sticksE && !DS9.sticksB ? label : ""}`);
+  }
+  return lines.join("\n") + "\n";
+}
+function drawDs9Preview(){
+  const cv = $("ds9prev");
+  if(!cv) return;
+  const src = $("cutcanvas");
+  const W = 640, H = 200;
+  cv.width = W; cv.height = H;
+  const ctx = cv.getContext("2d");
+  ctx.fillStyle = "#0d1017"; ctx.fillRect(0, 0, W, H);
+  if(src && src.width) ctx.drawImage(src, 0, 0, W, H);
+  ctx.globalAlpha = 0.35; ctx.fillStyle = "#0b0e14";
+  ctx.fillRect(0, 0, W, H); ctx.globalAlpha = 1;   // dim the map so symbols read
+  const {hDeg, wDeg, lonSpan} = cutoutSpans();
+  const pxDeg = W/wDeg;                             // px per TRUE degree (isotropic)
+  const px = dl => (0.5 - dl/lonSpan)*W;            // dl in longitude degrees
+  const py = db => (0.5 - db/hDeg)*H;
+  const gal2xy = (l, b) => [px((((l - REGION.l) + 540) % 360) - 180), py(b - REGION.b)];
+  const rm = getValues("rm");
+  const sel = ds9SelectedSources();
+  const step = Math.max(1, Math.floor(sel.length/700));   // keep the preview light
+  let drawn = 0;
+  for(let s = 0; s < sel.length; s += step){
+    const k = sel[s], i = REGION.sIdx[k];
+    const [x, y] = gal2xy(DATA.l[i], DATA.b[i]);
+    if(x < -20 || x > W + 20 || y < -20 || y > H + 20) continue;
+    const isSR = DATA.cat[i] === 1;
+    if(DS9.circles && isFinite(rm[i])){
+      ctx.strokeStyle = rm[i] >= 0 ? "#ff5a4d" : "#4d86ff";
+      ctx.lineWidth = 1.2;
+      if(DS9.dashSR && isSR) ctx.setLineDash([3, 2]);
+      ctx.beginPath();
+      ctx.arc(x, y, Math.max(1, ds9RadiusArcsec(rm[i])/3600*pxDeg), 0, 2*Math.PI);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    for(const [on, rot, col] of [[DS9.sticksE, false, "#ffe14d"], [DS9.sticksB, true, "#4dfff0"]]){
+      if(!on) continue;
+      const e = ds9StickEnds(i, k, rot);
+      if(!e) continue;
+      const g1 = eqToGal(e[0], e[1]), g2 = eqToGal(e[2], e[3]);
+      const [x1, y1] = gal2xy(g1[0], g1[1]), [x2, y2] = gal2xy(g2[0], g2[1]);
+      ctx.strokeStyle = col; ctx.lineWidth = 1.4;
+      ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+    }
+    if(DS9.marks){
+      ctx.strokeStyle = "rgba(255,255,255,0.8)"; ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x - 2, y - 2); ctx.lineTo(x + 2, y + 2);
+      ctx.moveTo(x - 2, y + 2); ctx.lineTo(x + 2, y - 2);
+      ctx.stroke();
+    }
+    drawn++;
+  }
+  ctx.fillStyle = "#9aa3b5"; ctx.font = "10px ui-monospace, Menlo, monospace";
+  ctx.textAlign = "left";
+  ctx.fillText(`preview: ${drawn}${step > 1 ? " of " + sel.length : ""} symbols over the cutout`, 6, H - 6);
+}
+function showDs9Modal(){
+  if(!REGION.active || !REGION.sIdx || !REGION.sIdx.length){ alert("Define a region first."); return; }
+  const rm = getValues("rm"), fp = getValues("fracpol"), pi = getValues("polint");
+  if(DS9.refRM === null) DS9.refRM = niceRound(regionPct(k => Math.abs(rm[REGION.sIdx[k]]), 98));
+  if(DS9.refP === null) DS9.refP = niceRound(regionPct(k => fp[REGION.sIdx[k]], 98));
+  if(DS9.refPI === null) DS9.refPI = niceRound(regionPct(k => pi[REGION.sIdx[k]], 98));
+  const n = REGION.sIdx.length;
+  const chk = (id, on, label, title) =>
+    `<label class="check" title="${title || ""}"><input type="checkbox" id="${id}" ${on ? "checked" : ""}> ${label}</label>`;
+  openModal("Aladin / DS9 region export", `
+    <p>Writes a DS9-format <code>.reg</code> file (fk5 / J2000) readable by Aladin Desktop
+    (File → Load), DS9 and CARTA. ${n.toLocaleString()} sources in the region.</p>
+    <canvas id="ds9prev" style="width:100%;border-radius:6px;margin:8px 0"></canvas>
+    <h4>Layers</h4>
+    ${chk("d9-circ", DS9.circles, "RM circles — red = RM&gt;0, blue = RM&lt;0, unfilled")}
+    ${chk("d9-se", DS9.sticksE, "Polarisation-angle sticks (E-vector, yellow)")}
+    ${chk("d9-sb", DS9.sticksB, "B-field sticks (E-vector + 90°, cyan)")}
+    ${chk("d9-marks", DS9.marks, "Centre marker (×) at each source")}
+    ${chk("d9-outline", DS9.outline, "Region outline (dashed green circle)")}
+    ${chk("d9-labels", DS9.labels, "ID labels (clutters beyond a few hundred sources)")}
+    ${chk("d9-dashsr", DS9.dashSR, "Draw SPICE-RACS symbols dashed")}
+    <h4>RM circle scaling</h4>
+    <div class="row"><label>radius &prop;</label>
+      <select id="d9-scale" style="width:170px">
+        <option value="sqrt" ${DS9.scale === "sqrt" ? "selected" : ""}>√|RM| (area ∝ |RM|)</option>
+        <option value="linear" ${DS9.scale === "linear" ? "selected" : ""}>|RM|</option>
+        <option value="square" ${DS9.scale === "square" ? "selected" : ""}>RM²</option>
+      </select>
+      <label>radius</label><input type="number" id="d9-maxrad" value="${DS9.maxRad}" min="2" max="600" style="width:64px">&Prime;
+      <label>at |RM| =</label><input type="number" id="d9-refrm" value="${DS9.refRM}" min="0.1" step="any" style="width:74px"> rad m⁻²</div>
+    <p style="font-size:11px">Radii cap at 3× the reference; sensible default = the region's 98th percentile |RM|.</p>
+    <h4>Stick scaling</h4>
+    <div class="row"><label>length &prop;</label>
+      <select id="d9-stickby" style="width:140px">
+        <option value="fracpol" ${DS9.stickBy === "fracpol" ? "selected" : ""}>frac. pol.</option>
+        <option value="polint" ${DS9.stickBy === "polint" ? "selected" : ""}>pol. intensity</option>
+        <option value="fixed" ${DS9.stickBy === "fixed" ? "selected" : ""}>fixed length</option>
+      </select>
+      <label>length</label><input type="number" id="d9-sticklen" value="${DS9.stickLen}" min="4" max="900" style="width:64px">&Prime;
+      <span id="d9-refwrap"><label>at</label><input type="number" id="d9-refp" value="${DS9.stickBy === "polint" ? DS9.refPI : DS9.refP}" min="0.001" step="any" style="width:74px">
+      <span id="d9-refunit">${DS9.stickBy === "polint" ? "mJy" : "%"}</span></span></div>
+    <h4>Size guard</h4>
+    <div class="row"><label>max sources</label>
+      <input type="number" id="d9-limit" value="${Math.min(DS9.limit, Math.max(1000, n))}" min="10" max="100000" style="width:90px">
+      <span style="font-size:11px;color:var(--muted)">brightest in polarised intensity kept first; Aladin gets sluggish beyond ~20k symbols</span></div>`,
+    [["Cancel", closeModal],
+     ["Open Aladin Lite ↗", () => {
+        const [cra, cdec] = galToEq(REGION.l, REGION.b);
+        window.open(`https://aladin.cds.unistra.fr/AladinLite/?target=${cra.toFixed(5)}%20${cdec.toFixed(5)}&fov=${Math.min(60, REGION.radius*2.5).toFixed(2)}`);
+      }],
+     ["Download .reg", () => {
+        const reg = buildDs9();
+        download(new Blob([reg], {type: "text/plain"}),
+            `possum_region_l${REGION.l.toFixed(1)}_b${REGION.b.toFixed(1)}_r${REGION.radius.toFixed(1)}deg.reg`);
+        closeModal();
+      }, true]]);
+  const sync = () => {
+    DS9.circles = $("d9-circ").checked; DS9.sticksE = $("d9-se").checked;
+    DS9.sticksB = $("d9-sb").checked; DS9.marks = $("d9-marks").checked;
+    DS9.outline = $("d9-outline").checked; DS9.labels = $("d9-labels").checked;
+    DS9.dashSR = $("d9-dashsr").checked;
+    DS9.scale = $("d9-scale").value;
+    DS9.maxRad = clamp(+$("d9-maxrad").value || 60, 2, 600);
+    DS9.refRM = Math.max(0.1, +$("d9-refrm").value || DS9.refRM);
+    DS9.stickBy = $("d9-stickby").value;
+    DS9.stickLen = clamp(+$("d9-sticklen").value || 90, 4, 900);
+    const rv = Math.max(0.001, +$("d9-refp").value || 1);
+    if(DS9.stickBy === "polint") DS9.refPI = rv; else DS9.refP = rv;
+    $("d9-refunit").textContent = DS9.stickBy === "polint" ? "mJy" : "%";
+    $("d9-refwrap").style.display = DS9.stickBy === "fixed" ? "none" : "inline";
+    DS9.limit = clamp(+$("d9-limit").value || 20000, 10, 100000);
+    safeDraw(drawDs9Preview);
+  };
+  $("modal").querySelectorAll("input, select").forEach(el => {
+    el.addEventListener("input", sync);
+    el.addEventListener("change", () => {
+      if(el.id === "d9-stickby"){
+        const nb = $("d9-stickby").value;   // read the NEW mode before sync()
+        $("d9-refp").value = nb === "polint" ? DS9.refPI : DS9.refP;
+      }
+      sync();
+    });
+  });
+  sync();
+}
+
+/* ---------- identify ------------------------------------------------------ */
+const IDENTIFY_TYPES = {
+  clusters: r => "galaxy cluster", erass1: r => "galaxy cluster (eRASS1)",
+  ktgroups: r => "galaxy group", ktgalaxies: r => "galaxy",
+  ngc: r => "galaxy (NGC/IC)", pulsars: r => "pulsar",
+  famous: null,   // type comes from the row itself
+};
+function identifyAt(mx, my){
+  const p = unproject(mx, my);
+  if(!p) return;
+  const [l, b] = p;
+  const [ra, dec] = galToEq(l, b);
+  const v = uvec(l, b);
+  const hits = [];
+  for(const key of Object.keys(DATA.overlays)){
+    const ov = DATA.overlays[key];
+    const iN = ov.fields.indexOf("name"), iL = ov.fields.indexOf("l"), iB = ov.fields.indexOf("b");
+    const iT = ov.fields.indexOf("type"), iZ = ov.fields.indexOf("z");
+    if(iN < 0) continue;
+    const typef = IDENTIFY_TYPES[key];
+    for(const r of ov.rows){
+      const w = uvec(r[iL], r[iB]);
+      const dot = v[0]*w[0] + v[1]*w[1] + v[2]*w[2];
+      if(dot < 0.9961947) continue;              // within 5 deg
+      const sep = Math.acos(Math.min(1, dot))*R2D;
+      let type = typef ? typef(r) : (iT >= 0 ? r[iT] : key);
+      if(iZ >= 0 && typeof r[iZ] === "number") type += ` z=${r[iZ]}`;
+      hits.push({name: r[iN], type, sep, l: r[iL], b: r[iB], cat: ov.label});
+    }
+  }
+  hits.sort((a, b) => a.sep - b.sep);
+  const top = hits.slice(0, 10);
+  const el = $("inspect");
+  const rowsHtml = top.length ? top.map((h, i) =>
+    `<div class="identify-row" data-i="${i}">
+       <span><b>${h.name}</b><br><span class="t">${h.type} · ${h.cat}</span></span>
+       <span class="s">${h.sep < 1 ? (h.sep*60).toFixed(1) + "′" : h.sep.toFixed(2) + "°"}</span>
+     </div>`).join("")
+    : `<div class="hint">Nothing in the embedded catalogues within 5°.</div>`;
+  el.innerHTML = `<div class="hd"><span>&#9737; Identify &mdash; l=${l.toFixed(2)}° b=${b.toFixed(2)}°</span><span class="x">✕</span></div>
+    <div class="bd">
+      ${rowsHtml}
+      <div id="simbadres"></div>
+    </div>
+    <div class="foot" style="flex-wrap:wrap">
+      <button class="mini primary" id="id-simbad">Query SIMBAD</button>
+      <button class="mini" id="id-simbad-web">SIMBAD ↗</button>
+      <button class="mini" id="id-ned">NED ↗</button>
+      <button class="mini" id="id-aladin">Aladin ↗</button>
+    </div>`;
+  positionInspect(el, mx, my);
+  el.querySelector(".x").onclick = hideInspect;
+  el.querySelectorAll(".identify-row").forEach(d => d.onclick = () => {
+    const h = top[+d.dataset.i];
+    flyTo(h.l, h.b, Math.max(VIEW.zoom, 8));
+  });
+  const coord = `${ra.toFixed(5)} ${dec.toFixed(5)}`;
+  $("id-simbad-web").onclick = () => window.open(
+      `https://simbad.u-strasbg.fr/simbad/sim-coo?Coord=${encodeURIComponent(coord)}&Radius=15&Radius.unit=arcmin`);
+  $("id-ned").onclick = () => window.open(
+      `https://ned.ipac.caltech.edu/cgi-bin/objsearch?search_type=Near+Position+Search&in_csys=Equatorial&in_equinox=J2000.0&lon=${ra.toFixed(5)}d&lat=${dec.toFixed(5)}d&radius=15`);
+  $("id-aladin").onclick = () => window.open(
+      `https://aladin.cds.unistra.fr/AladinLite/?target=${ra.toFixed(5)}%20${dec.toFixed(5)}&fov=2`);
+  $("id-simbad").onclick = () => querySimbad(ra, dec);
+}
+async function querySimbad(ra, dec){
+  const host = $("simbadres");
+  host.innerHTML = `<div class="hint">Querying SIMBAD…</div>`;
+  const adql = `SELECT TOP 12 main_id, otype, ra, dec,
+      DISTANCE(POINT('ICRS', ra, dec), POINT('ICRS', ${ra}, ${dec})) AS d
+      FROM basic
+      WHERE CONTAINS(POINT('ICRS', ra, dec), CIRCLE('ICRS', ${ra}, ${dec}, 0.4)) = 1
+        AND ra IS NOT NULL ORDER BY d ASC`;
+  try{
+    const r = await fetch("https://simbad.cds.unistra.fr/simbad/sim-tap/sync?" +
+        new URLSearchParams({request: "doQuery", lang: "adql", format: "json", query: adql}),
+        {signal: AbortSignal.timeout(15000)});
+    if(!r.ok) throw new Error("HTTP " + r.status);
+    const j = await r.json();
+    if(!j.data || !j.data.length){ host.innerHTML = `<div class="hint">SIMBAD: nothing within 0.4°.</div>`; return; }
+    host.innerHTML = `<div class="hint" style="margin-top:8px;color:var(--acc2)">SIMBAD (live):</div>` +
+      j.data.map(row => {
+        const sep = row[4];
+        return `<div class="identify-row">
+          <span><b>${row[0]}</b><br><span class="t">${row[1]} · SIMBAD</span></span>
+          <span class="s">${sep < 1/60 ? (sep*3600).toFixed(1) + "″" : sep < 1 ? (sep*60).toFixed(1) + "′" : sep.toFixed(2) + "°"}</span>
+        </div>`;
+      }).join("");
+  }catch(err){
+    host.innerHTML = `<div class="hint" style="color:var(--warn)">SIMBAD query failed
+      (${String(err.message || err).slice(0, 60)}) — needs internet access; use the ↗ buttons instead.</div>`;
+  }
+}
+
+/* ---------- help / about ------------------------------------------------ */
+function showHelp(){
+  openModal("POSSUM DR1 Sky Explorer — help", `
+    <h4>Navigation</h4>
+    <ul>
+      <li>Drag to rotate; scroll to zoom (zoom follows the cursor); double-click to zoom in on a point; arrow keys pan.</li>
+      <li><kbd>g</kbd> toggle graticule · <kbd>b</kbd> toggle bubbles · <kbd>r</kbd> reset view · <kbd>?</kbd> this help.</li>
+      <li>Click any point of the map to inspect the component under it (all catalogued quantities + cat_id).</li>
+    </ul>
+    <h4>The map</h4>
+    <ul>
+      <li>The tessellation shows the value of the <i>single nearest catalogued component</i> at every sky point — a spherical Voronoi diagram of the RM grid itself, with no binning or smoothing (the DR1 paper's headline-figure method).</li>
+      <li>Sky further than the max-cell-size limit from any component is left blank, which traces the survey footprint.</li>
+      <li>Source filters re-select the sample and rebuild the tessellation live; the map always shows exactly the current selection.</li>
+      <li>“Auto-refine” recomputes the tessellation at screen resolution for the visible region after you zoom, so cells stay crisp at any depth.</li>
+      <li>Bubble mode is the classic RM-grid representation: circle area ∝ |RM| (saturating at the colour-scale max), red = positive, blue = negative.</li>
+    </ul>
+    <h4>Tools (top bar, or keys <kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd>)</h4>
+    <ul>
+      <li><b>Region</b>: click a centre, hold and drag outward, release to fix a circle (max 20°).
+        A card shows RM statistics (mean / median / σ / 1.4826×MAD); the <b>Region analysis</b> tab
+        adds a histogram of any quantity, a source table, and CSV export with a per-source
+        catalogue + separation column. The region tracks the active source filters.
+        <b>Aladin / DS9 export</b> writes a .reg overlay (fk5): RM circles (red positive /
+        blue negative, radius ∝ √|RM|, |RM| or RM²), E-vector or B-field sticks scaled by
+        frac. pol. or pol. intensity, centre markers and ID labels — load it in Aladin
+        Desktop via File → Load over any survey image.</li>
+      <li><b>Identify</b>: click anywhere to rank the 10 nearest known objects (clusters, groups,
+        galaxies, pulsars, curated objects) by separation, query SIMBAD live (needs internet),
+        or jump out to SIMBAD/NED/Aladin at those coordinates.</li>
+    </ul>
+    <h4>Datasets</h4>
+    <ul>
+      <li>SPICE-RACS DR2 components (snr≥6, goodI, no leakage flag, 15″ de-duplicated) can be added
+        wherever POSSUM has no coverage (&gt;0.4° from every POSSUM component). Render either survey
+        in greyscale to tell the two grids apart at a glance; every cell, inspect card and export
+        row carries its source catalogue.</li>
+    </ul>
+    <h4>Overlays &amp; import</h4>
+    <ul>
+      <li>Built-in overlays: curated objects of interest, X-ray/SZ galaxy clusters and the eRASS1
+        primary sample (circles = R500, faint = ~virial radius), Kourkchi–Tully groups and local
+        galaxies, NGC/IC galaxies, ATNF pulsars.</li>
+      <li>Import any CSV/TSV with coordinates to add your own overlay (e.g. a 6dFGS export);
+        numeric columns become filter sliders.</li>
+    </ul>`,
+    [["Close", closeModal, true]]);
+}
+function buildAbout(){
+  $("aboutbody").innerHTML = `
+    <div class="hint" style="font-size:11.5px">
+      <p style="margin-bottom:6px"><b style="color:var(--ink)">POSSUM</b> — the Polarisation Sky Survey of the
+      Universe's Magnetism — is mapping the magnetised Universe with ASKAP. This explorer visualises the
+      Data Release 1 rotation-measure grid: <b style="color:var(--ink)">${MANIFEST.n_sources.toLocaleString()}</b>
+      polarised components (${MANIFEST.selection || ""}).</p>
+      <p style="margin-bottom:6px">Maps are nearest-neighbour tessellations computed live in your browser —
+      the same method as the DR1 paper's all-sky figures.${MANIFEST.source_files ? " Sources: " + MANIFEST.source_files.polsel + ", de-duplication " + MANIFEST.source_files.dedup + "." : ""}</p>
+      ${MANIFEST.note ? '<p style="margin-bottom:6px;color:var(--warn)">' + MANIFEST.note + '</p>' : ""}
+      <p style="margin-bottom:6px">SPICE-RACS: ${MANIFEST.sr.n_sources.toLocaleString()} DR2 components
+      (${MANIFEST.sr.selection || ""}) can be blended in wherever POSSUM has no coverage — see the
+      Datasets panel.</p>
+      <p>Overlay catalogues: MCXC-II (Sadibekova+ 2024), PSZ2 (Planck 2016), ACT DR5 (Hilton+ 2021),
+      eRASS1 (Bulbul+ 2024), Kourkchi &amp; Tully (2017), OpenNGC, ATNF pulsar catalogue.
+      Cluster circles show θ<sub>500</sub> from M<sub>500</sub> (flat ΛCDM, H₀=70, Ωm=0.3); the faint outer
+      circle is 1.36×θ<sub>500</sub> ≈ the virial radius.</p>
+      <p style="margin-top:8px">Data package <b>${MANIFEST.version || "unversioned"}</b>${MANIFEST.built ? " (built " + MANIFEST.built.slice(0, 16).replace("T", " ") + ")" : ""}
+      · ${EMBED.main ? "single-file build, data embedded, works offline" : "hosted build, data fetched from " + (CONFIG && CONFIG.dataBase || "config")}
+      · source: <a href="https://github.com/possum-survey/possum-sky-explorer" target="_blank" rel="noopener">possum-sky-explorer</a>
+      · <a href="#" id="helplink">Keyboard &amp; usage help</a></p>
+    </div>`;
+  $("helplink").onclick = e => { e.preventDefault(); showHelp(); };
+}
+
+/* ---------- boot --------------------------------------------------------- */
+function fatal(msg){
+  const f = $("fatal");
+  f.style.display = "flex";
+  f.innerHTML = "<div><h2 style='margin-bottom:10px'>POSSUM DR1 Sky Explorer</h2><p>" + msg + "</p></div>";
+}
+async function boot(){
+  try{
+    showProgress("Loading catalogue…");
+    const payload = await loadPayloads((label, frac) => {
+      $("progresstext").textContent = label + "…";
+      setProgress(frac);
+    });
+    $("progresstext").textContent = "Decoding catalogue…";
+    decodeMain(payload.main, payload.sr);
+    decodeOverlays(payload.overlays);
+    hideProgress();
+    if(CONFIG && CONFIG.title) document.title = CONFIG.title;
+    if(MANIFEST.demo){
+      const d = document.createElement("div");
+      d.className = "pill";
+      d.style.cssText = "background:#5a2d00dd;border-color:#e0a33b;color:#ffd79a;font-weight:600";
+      d.textContent = "SYNTHETIC DEMO DATA";
+      $("viewinfo").prepend(d);
+    }
+    $("brandcount").textContent = MANIFEST.n_sources.toLocaleString() +
+        " polarised components · ASKAP" +
+        (MANIFEST.version ? " · data " + MANIFEST.version : "");
+    initGL();
+    const hadHash = loadHash();
+    await initWorker();
+    // UI populate
+    const qsel = $("quantity");
+    for(const k of Object.keys(QUANTITIES))
+      qsel.add(new Option(QUANTITIES[k].label, k));
+    const csel = $("cmap");
+    for(const k of Object.keys(LUTS)) csel.add(new Option(k.replace("cmr.", "cmasher: "), k));
+    buildFilterUI();
+    buildOverlayUI();
+    buildAbout();
+    buildSearchIndex();
+    initInteraction();
+    // wire controls
+    qsel.onchange = () => { setQuantity(qsel.value, false); saveHash(); scheduleRefine(); };
+    $("mapmode").onchange = e => setMapMode(e.target.value);
+    $("projection").onchange = e => {
+      VIEW.proj = e.target.value;
+      VIEW.panX = VIEW.panY = 0;
+      if(VIEW.proj === "mollweide"){ VIEW.lat0 = 0; }
+      requestRender(); scheduleRefine(); saveHash();
+    };
+    $("frame").onchange = e => {
+      // keep looking at the same sky point when switching frame
+      const centreGal = (VIEW.frame === "gal") ? [VIEW.lon0, VIEW.lat0] : eqToGal(VIEW.lon0, VIEW.lat0);
+      VIEW.frame = e.target.value;
+      const c = (VIEW.frame === "gal") ? centreGal : galToEq(centreGal[0], centreGal[1]);
+      VIEW.lon0 = c[0]; VIEW.lat0 = clamp(c[1], -89.9, 89.9);
+      requestRender(); scheduleRefine(); saveHash();
+    };
+    $("bgtheme").onchange = e => { VIEW.theme = e.target.value; updateColorbar(); requestRender(); saveHash(); };
+    $("cmap").onchange = e => { VIEW.cmap = e.target.value; uploadLUT(); updateColorbar(); requestRender(); saveHash(); };
+    $("cmapflip").onclick = () => { VIEW.cmapFlip = !VIEW.cmapFlip; updateColorbar(); requestRender(); };
+    $("stretch").onchange = e => {
+      VIEW.stretch = e.target.value;
+      $("linthreshrow").style.display = (VIEW.stretch === "symlog" || VIEW.stretch === "asinh") ? "flex" : "none";
+      if(VIEW.stretch === "log" && VIEW.vmin <= 0){
+        const [lo] = defaultRangeFor(VIEW.quantity);
+        VIEW.vmin = Math.max(Math.abs(lo)*1e-2, 1e-4);
+      }
+      rebuildVRangeSlider();
+      applyHisteq(); updateColorbar(); requestRender(); saveHash();
+    };
+    $("linthresh").onchange = e => { VIEW.linthresh = Math.max(1e-6, +e.target.value); updateColorbar(); requestRender(); };
+    $("vmin").onchange = e => setVRange(+e.target.value, VIEW.vmax);
+    $("vmax").onchange = e => setVRange(VIEW.vmin, +e.target.value);
+    document.querySelectorAll("[data-pct]").forEach(b => b.onclick = () => {
+      const [a, c] = b.dataset.pct.split(",").map(Number);
+      const vals = getValues(VIEW.quantity);
+      let [lo, hi] = percentilesOf(vals, DATA.filteredIdx, [a, c]);
+      if(VIEW.stretch === "log") lo = Math.max(lo, hi*1e-8);
+      setVRange(lo, hi);
+    });
+    $("symzero").onclick = () => {
+      const m = Math.max(Math.abs(VIEW.vmin), Math.abs(VIEW.vmax));
+      setVRange(-m, m);
+    };
+    $("preset-rm").onclick = PRESETS.rm;
+    $("preset-polint").onclick = PRESETS.polint;
+    $("preset-fracpol").onclick = PRESETS.fracpol;
+    $("preset-polang").onclick = PRESETS.polang;
+    $("btn-reset").onclick = resetView;
+    ["grid-gal", "grid-eq", "grid-labels", "autorefine"].forEach(id => {
+      $(id).onchange = e => {
+        const v = e.target.checked;
+        if(id === "grid-gal") VIEW.gridGal = v;
+        else if(id === "grid-eq") VIEW.gridEq = v;
+        else if(id === "grid-labels") VIEW.gridLabels = v;
+        else VIEW.autorefine = v;
+        requestRender();
+        if(id === "autorefine" && v) scheduleRefine();
+      };
+    });
+    $("tessres").onchange = e => { VIEW.tessres = +e.target.value; pipelineFilterChanged(); };
+    $("maxsep").onchange = e => { VIEW.maxsep = e.target.value; pipelineFilterChanged(); };
+    const bs = document.createElement("div");
+    $("bubblesize-slider").replaceWith(bs);
+    dualSlider(bs, {label: "Bubble size", min: 3, max: 40, lo: VIEW.bubbleScale, dec: 0, single: true,
+        onChange: v => { VIEW.bubbleScale = v; requestRender(); }});
+    const ba = document.createElement("div");
+    $("bubblealpha-slider").replaceWith(ba);
+    dualSlider(ba, {label: "Bubble opacity", min: 0.1, max: 1, lo: VIEW.bubbleAlpha, dec: 2, single: true,
+        onChange: v => { VIEW.bubbleAlpha = v; requestRender(); }});
+    // move bubble sliders into bubbleopts container
+    $("bubbleopts").prepend(ba); $("bubbleopts").prepend(bs);
+    $("burger").onclick = () => {
+      $("sidebar").classList.toggle("collapsed");
+      resize(); requestRender(); setTimeout(() => { resize(); requestRender(); }, 30);
+    };
+    // datasets / tools / tabs
+    $("dataset").onchange = e => {
+      VIEW.dataset = e.target.value;
+      $("catmoderow").style.display = VIEW.dataset === "both" ? "flex" : "none";
+      $("blinkctl").style.display = VIEW.dataset === "blink" ? "block" : "none";
+      $("srhint").style.display = (VIEW.dataset === "both" || VIEW.dataset === "blink") ? "block" : "none";
+      pipelineFilterChanged();
+    };
+    $("catmode").onchange = e => { VIEW.catMode = e.target.value; requestRender(); };
+    const bsp = document.createElement("div");
+    $("blinkspeed-slider").replaceWith(bsp);
+    dualSlider(bsp, {label: "Blink period / s", min: 0.25, max: 3, lo: BLINK.period/1000,
+        dec: 2, single: true, onChange: v => {
+          BLINK.period = Math.round(v*1000);
+          if(BLINK.timer) startBlink();
+        }});
+    $("blinkctl").prepend(bsp);
+    $("blinkpause").onclick = () => {
+      BLINK.paused = !BLINK.paused;
+      $("blinkpause").textContent = BLINK.paused ? "Resume" : "Pause";
+    };
+    $("blinkstep").onclick = () => {
+      if(BLINK.mapA && BLINK.mapB){ BLINK.phase ^= 1; blinkApplyPhase(); }
+    };
+    $("tool-explore").onclick = () => setTool("explore");
+    $("tool-region").onclick = () => setTool("region");
+    $("tool-identify").onclick = () => setTool("identify");
+    $("tab-explorer").onclick = () => setTab("explorer");
+    $("tab-region").onclick = () => setTab("region");
+    $("searchbox").oninput = debounce(e => doSearch($("searchbox").value), 160);
+    $("searchbox").onfocus = () => doSearch($("searchbox").value);
+    document.addEventListener("click", e => {
+      if(!$("search").contains(e.target)) $("searchres").style.display = "none";
+    });
+    $("importbtn").onclick = () => $("importfile").click();
+    $("importfile").onchange = async e => {
+      const f = e.target.files[0];
+      if(!f) return;
+      try{
+        const text = await f.text();
+        importDialog(parseCSV(text), f.name);
+      }catch(err){ alert("Import failed: " + err.message); }
+      e.target.value = "";
+    };
+    $("exp-png").onclick = () => exportImage("png");
+    $("exp-pdf").onclick = () => exportImage("pdf");
+    $("exp-csv").onclick = exportCSV;
+    $("modalback").addEventListener("click", e => { if(e.target === $("modalback")) closeModal(); });
+    document.querySelectorAll(".sec-head").forEach(h =>
+      h.onclick = () => h.parentElement.classList.toggle("open"));
+    // sync UI from VIEW (possibly loaded from hash)
+    $("projection").value = VIEW.proj;
+    $("frame").value = VIEW.frame;
+    $("bgtheme").value = VIEW.theme;
+    setMapMode(VIEW.mapmode);
+    window.addEventListener("resize", () => { resize(); requestRender(); scheduleRefine(); });
+    resize();
+    // first pipeline
+    setQuantity(VIEW.quantity, hadHash);
+    if(hadHash){
+      $("cmap").value = VIEW.cmap; $("stretch").value = VIEW.stretch;
+      uploadLUT(); updateColorbar();
+    }
+    await pipelineFilterChanged();
+    // render loop
+    (function loop(){
+      if(needRender){ needRender = false; render(); updateViewPill(); }
+      requestAnimationFrame(loop);
+    })();
+    // initial famous overlay
+    refreshOverlay("famous");
+  }catch(err){
+    console.error(err);
+    fatal("Failed to start: " + (err && err.message || err));
+  }
+}
+function updateViewPill(){
+  const c = (VIEW.frame === "gal")
+      ? `l=${VIEW.lon0.toFixed(1)}° b=${VIEW.lat0.toFixed(1)}°`
+      : `α=${VIEW.lon0.toFixed(1)}° δ=${VIEW.lat0.toFixed(1)}°`;
+  $("pill-view").innerHTML = c + " · zoom <b>" + VIEW.zoom.toFixed(1) + "×</b>";
+}
+boot();
+</script>
+</body>
+</html>

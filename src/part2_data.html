@@ -1,0 +1,570 @@
+<script>
+"use strict";
+/* ==================================================================
+   POSSUM DR1 Sky Explorer — data layer
+   ================================================================== */
+/* Build-time substitutions. Embedded build: JSON + base64 payloads inlined, CONFIG_URL
+   empty. Hosted build: these are null/empty and the page fetches CONFIG_URL at start. */
+const EMBED = {
+  manifest: __MANIFEST__,
+  luts: __LUTS__,
+  main: "__MAIN_B64__",
+  sr: "__SR_B64__",
+  overlays: "__OVERLAYS_B64__",
+};
+const CONFIG_URL = "__CONFIG_URL__";
+let MANIFEST = EMBED.manifest;     // assigned by loadPayloads() in hosted mode
+let LUTS = EMBED.luts;
+let CONFIG = null;                 // hosted mode: the parsed config.json
+
+const D2R = Math.PI/180, R2D = 180/Math.PI;
+// Galactic <-> ICRS rotation (J2000). v_gal = GAL_R * v_eq.
+const GAL_R = [
+  -0.0548755604, -0.8734370902, -0.4838350155,
+   0.4941094279, -0.4448296300,  0.7469822445,
+  -0.8676661490, -0.1980763734,  0.4559837762];
+function matTvec(m,v){ return [m[0]*v[0]+m[3]*v[1]+m[6]*v[2], m[1]*v[0]+m[4]*v[1]+m[7]*v[2], m[2]*v[0]+m[5]*v[1]+m[8]*v[2]]; }
+function matvec(m,v){ return [m[0]*v[0]+m[1]*v[1]+m[2]*v[2], m[3]*v[0]+m[4]*v[1]+m[5]*v[2], m[6]*v[0]+m[7]*v[1]+m[8]*v[2]]; }
+function uvec(lon,lat){ const cl=Math.cos(lat*D2R); return [cl*Math.cos(lon*D2R), cl*Math.sin(lon*D2R), Math.sin(lat*D2R)]; }
+function lonlat(v){ return [((Math.atan2(v[1],v[0])*R2D)+360)%360, Math.asin(Math.max(-1,Math.min(1,v[2])))*R2D]; }
+function galToEq(l,b){ return lonlat(matTvec(GAL_R, uvec(l,b))); }
+function eqToGal(ra,dec){ return lonlat(matvec(GAL_R, uvec(ra,dec))); }
+
+async function gunzipBytes(bytes){
+  if(!bytes || !bytes.length) return new ArrayBuffer(0);
+  if(typeof DecompressionStream === "undefined")
+    throw new Error("This browser lacks DecompressionStream (needs Chrome 80+, Firefox 113+, Safari 16.4+).");
+  const ds = new DecompressionStream("gzip");
+  const stream = new Blob([bytes]).stream().pipeThrough(ds);
+  return await new Response(stream).arrayBuffer();
+}
+async function gunzipB64(b64){
+  if(!b64) return new ArrayBuffer(0);
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++) bytes[i] = bin.charCodeAt(i);
+  return gunzipBytes(bytes);
+}
+
+/* ---------- payload acquisition: embedded or config-driven fetch -------------- */
+function resolveConfigUrl(){
+  // ?config=<url> overrides the build-time default (lets one page serve several datasets)
+  try{
+    const q = new URLSearchParams(location.search).get("config");
+    if(q) return q;
+  }catch(e){}
+  return CONFIG_URL;
+}
+async function fetchBytes(url, onProgress, label){
+  const r = await fetch(url, {cache: "default"});
+  if(!r.ok) throw new Error(`fetch ${url}: HTTP ${r.status}`);
+  const total = +r.headers.get("content-length") || 0;
+  if(!r.body || !onProgress) return new Uint8Array(await r.arrayBuffer());
+  const reader = r.body.getReader();
+  const chunks = []; let got = 0;
+  while(true){
+    const {done, value} = await reader.read();
+    if(done) break;
+    chunks.push(value); got += value.length;
+    if(total) onProgress(label, got/total);
+  }
+  const out = new Uint8Array(got); let o = 0;
+  for(const c of chunks){ out.set(c, o); o += c.length; }
+  return out;
+}
+async function loadPayloads(onProgress){
+  // returns {main, sr, overlays} as gunzipped ArrayBuffers; sets MANIFEST / LUTS / CONFIG
+  if(EMBED.main){                         // embedded build
+    onProgress && onProgress("Decoding embedded catalogue", 0.2);
+    return {main: await gunzipB64(EMBED.main), sr: await gunzipB64(EMBED.sr),
+            overlays: await gunzipB64(EMBED.overlays)};
+  }
+  const cfgUrl = resolveConfigUrl();
+  if(!cfgUrl) throw new Error("no embedded data and no config URL — was the page built correctly?");
+  if(location.protocol === "file:")
+    throw new Error("The hosted build must be served over http(s) (browsers block fetch() from file://). " +
+                    "Run e.g. `python3 -m http.server` in the dist folder, or use the single-file build.");
+  const cr = await fetch(cfgUrl, {cache: "no-cache"});
+  if(!cr.ok) throw new Error(`config ${cfgUrl}: HTTP ${cr.status}`);
+  CONFIG = await cr.json();
+  const base = new URL(CONFIG.dataBase || "data/", new URL(cfgUrl, location.href)).href;
+  const F = Object.assign({manifest: "manifest.json", luts: "luts.json",
+      possum: "main_catalogue.bin.gz", spiceracs: "sr_catalogue.bin.gz",
+      overlays: "overlays.json.gz"}, CONFIG.files || {});
+  const u = k => new URL(F[k], base).href;
+  MANIFEST = await (await fetch(u("manifest"))).json();
+  LUTS = await (await fetch(u("luts"))).json();
+  const [mainGz, srGz, ovGz] = await Promise.all([
+    fetchBytes(u("possum"), onProgress, "POSSUM catalogue"),
+    fetchBytes(u("spiceracs"), onProgress, "SPICE-RACS catalogue"),
+    fetchBytes(u("overlays"), onProgress, "overlays"),
+  ]);
+  onProgress && onProgress("Decompressing", 0.95);
+  return {main: await gunzipBytes(mainGz), sr: await gunzipBytes(srGz), overlays: await gunzipBytes(ovGz)};
+}
+
+/* ---------- quantity definitions -------------------------------- */
+function dequantLog(u16, lo, hi){ // uint16 -> value
+  const n = u16.length, out = new Float32Array(n), s=(hi-lo)/65535;
+  for(let i=0;i<n;i++) out[i] = Math.pow(10, lo + u16[i]*s);
+  return out;
+}
+function dequantLin(u16, lo, hi){
+  const n = u16.length, out = new Float32Array(n), s=(hi-lo)/65535;
+  for(let i=0;i<n;i++) out[i] = lo + u16[i]*s;
+  return out;
+}
+
+// Display-quantity registry. `get` builds the float array lazily.
+const QUANTITIES = {
+  rm:      {label:"RM", unit:"rad m⁻²", tex:"RM / rad m^-2",
+            cmap:"RdBu_r", stretch:"linear", vlim:[-150,150], diverging:true, dec:1},
+  polint:  {label:"Polarised intensity", unit:"mJy beam⁻¹", tex:"polarised intensity / mJy beam^-1",
+            cmap:"cmr.rainforest", stretch:"log", pct:[1,99.5], scale:1e3, dec:3},
+  fracpol: {label:"Fractional polarisation", unit:"%", tex:"fractional polarisation / per cent",
+            cmap:"cmr.ember", stretch:"log", pct:[1,99.5], scale:1e2, dec:2},
+  snr:     {label:"Polarised S/N", unit:"", tex:"S/N (polarised intensity)",
+            cmap:"viridis", stretch:"log", pct:[0,99], dec:1},
+  stokesI: {label:"Stokes I", unit:"mJy beam⁻¹", tex:"Stokes I / mJy beam^-1",
+            cmap:"cividis", stretch:"log", pct:[1,99.5], scale:1e3, dec:3},
+  rm_err:  {label:"RM uncertainty", unit:"rad m⁻²", tex:"sigma_RM / rad m^-2",
+            cmap:"magma", stretch:"log", pct:[1,99], dec:3},
+  spidx:   {label:"Spectral index", unit:"", tex:"spectral index (alpha)",
+            cmap:"coolwarm", stretch:"linear", vlim:[-2.0,1.0], diverging:true, dec:2},
+  polang:  {label:"Pol. angle (derotated)", unit:"°", tex:"derotated polarisation angle / deg",
+            cmap:"twilight", stretch:"linear", vlim:[0,180], cyclic:true, dec:1},
+};
+
+const DATA = {
+  n: 0, nP: 0, nS: 0,                 // total / POSSUM / SPICE-RACS counts
+  l:null, b:null, ux:null, uy:null, uz:null,
+  cat:null,      // Uint8Array: 0 = POSSUM, 1 = SPICE-RACS
+  cols:{},       // POSSUM id columns (sbid/compnum/complet)
+  sr:{},         // SR id columns (tile/num)
+  values:{},     // precomputed display arrays per quantity key (full length n)
+  sbids: null,       // set from MANIFEST after load
+  overlays: null,
+  filteredIdx: null,   // Uint32Array of currently passing source indices
+  filterCount: 0, filterCountP: 0, filterCountS: 0,
+};
+const CAT_NAMES = ["POSSUM", "SPICE-RACS"];
+
+function getValues(q){
+  const v = DATA.values[q];
+  if(!v) throw new Error("unknown quantity "+q);
+  return v;
+}
+
+function catId(i){
+  if(DATA.cat[i] === 0)
+    return "SB"+DATA.sbids[DATA.cols.sbid[i]]+"_component_"+DATA.cols.compnum[i]+String.fromCharCode(97+DATA.cols.complet[i]);
+  const j = i - DATA.nP;
+  return "RACS_"+MANIFEST.sr.tiles[DATA.sr.tile[j]]+"_"+DATA.sr.num[j];
+}
+function catName(i){ return CAT_NAMES[DATA.cat[i]]; }
+
+function unshuffle(bytes, itemsize){
+  // inverse of the builder's byte-shuffle: bytes laid out as [byte0 of all][byte1 of all]...
+  const n = bytes.length/itemsize;
+  const out = new Uint8Array(bytes.length);
+  for(let j=0;j<itemsize;j++){
+    const base = j*n;
+    for(let i=0;i<n;i++) out[i*itemsize+j] = bytes[base+i];
+  }
+  return out;
+}
+function decodeCatalogue(buf, colspec){
+  const all = new Uint8Array(buf);
+  const cols = {};
+  for(const c of colspec){
+    const isz = c.dtype === "uint8" ? 1 : (c.dtype === "uint16" || c.dtype === "int16") ? 2 : 4;
+    let bytes = all.subarray(c.offset, c.offset + c.bytes);
+    bytes = (c.shuffled && isz > 1) ? unshuffle(bytes, isz) : bytes.slice();
+    cols[c.name] =
+      c.dtype === "float32" ? new Float32Array(bytes.buffer) :
+      c.dtype === "uint32"  ? new Uint32Array(bytes.buffer)  :
+      c.dtype === "uint16"  ? new Uint16Array(bytes.buffer)  :
+      c.dtype === "int16"   ? new Int16Array(bytes.buffer)   :
+      c.dtype === "uint8"   ? bytes : null;
+  }
+  return cols;
+}
+function decodePositions(cols, n){
+  if(!n) return [new Float32Array(0), new Float32Array(0)];
+  const dl = cols.l, b32 = cols.b;
+  const L = new Float32Array(n), B = new Float32Array(n);
+  let acc = 0;
+  for(let i=0;i<n;i++){ acc = (acc + dl[i]) >>> 0; L[i] = acc/100000; B[i] = b32[i]/100000 - 90; }
+  return [L, B];
+}
+function decodeMain(mainBuf, srBuf){
+  DATA.sbids = MANIFEST.sbids;
+  const P = decodeCatalogue(mainBuf, MANIFEST.columns);
+  const S = decodeCatalogue(srBuf, MANIFEST.sr.columns);
+  const nP = MANIFEST.n_sources, nS = MANIFEST.sr.n_sources, n = nP + nS;
+  DATA.nP = nP; DATA.nS = nS; DATA.n = n;
+  const [LP, BP] = decodePositions(P, nP);
+  const [LS, BS] = decodePositions(S, nS);
+  DATA.l = new Float32Array(n); DATA.l.set(LP); DATA.l.set(LS, nP);
+  DATA.b = new Float32Array(n); DATA.b.set(BP); DATA.b.set(BS, nP);
+  DATA.cat = new Uint8Array(n); DATA.cat.fill(1, nP);
+  DATA.cols = {sbid: P.sbid, compnum: P.compnum, complet: P.complet};
+  DATA.sr = {tile: S.tile, num: S.num};
+  DATA.srInP = S.inp;      // per-SR-source: 1 = within POSSUM coverage (0.4 deg)
+  // precompute display arrays: POSSUM part with MANIFEST.quant, SR with MANIFEST.sr.quant
+  function concatQ(q){
+    const out = new Float32Array(n);
+    const sc = QUANTITIES[q].scale || 1;
+    function fill(cols, quant, off, m){
+      let part;
+      if(q === "rm") part = cols.rm;
+      else if(q === "spidx"){ part = new Float32Array(m); for(let i=0;i<m;i++) part[i] = cols.spidx[i]/1000; }
+      else if(q === "polang"){ part = new Float32Array(m); for(let i=0;i<m;i++) part[i] = cols.polang[i]*180/255; }
+      else if(!m) part = new Float32Array(0);
+      else part = dequantLog(cols[q], quant[q].lo, quant[q].hi);
+      if(sc !== 1){ for(let i=0;i<m;i++) out[off+i] = part[i]*sc; }
+      else out.set(part, off);
+    }
+    fill(P, MANIFEST.quant, 0, nP);
+    fill(S, MANIFEST.sr.quant, nP, nS);
+    return out;
+  }
+  for(const q of Object.keys(QUANTITIES)) DATA.values[q] = concatQ(q);
+  DATA.ux = new Float32Array(n); DATA.uy = new Float32Array(n); DATA.uz = new Float32Array(n);
+  for(let i=0;i<n;i++){
+    const cl = Math.cos(DATA.b[i]*D2R);
+    DATA.ux[i] = cl*Math.cos(DATA.l[i]*D2R);
+    DATA.uy[i] = cl*Math.sin(DATA.l[i]*D2R);
+    DATA.uz[i] = Math.sin(DATA.b[i]*D2R);
+  }
+}
+function decodeOverlays(buf){
+  DATA.overlays = buf.byteLength ? JSON.parse(new TextDecoder().decode(buf)) : {};
+}
+
+/* ---------- filter model ----------------------------------------- */
+// Each filter acts on a display quantity. Spec: {q, lo, hi} in display units.
+const FILTER_DEFS = [
+  {q:"snr",     label:"Polarised S/N", log:true,  lo:6,    hi:16200},
+  {q:"fracpol", label:"Frac. pol. / %", log:true, lo:0.09, hi:260},
+  {q:"polint",  label:"Pol. int. / mJy", log:true, lo:0.08, hi:2700},
+  {q:"stokesI", label:"Stokes I / mJy", log:true, lo:0.4,  hi:56000},
+  {q:"rm",      label:"|RM| / rad m⁻²", log:true, lo:0.01, hi:6000, absval:true},
+  {q:"rm_err",  label:"σ(RM) / rad m⁻²", log:true, lo:0.002, hi:40},
+  {q:"spidx",   label:"Spectral index", log:false, lo:-4, hi:4},
+];
+let filterState = FILTER_DEFS.map(f => ({q:f.q, lo:f.lo, hi:f.hi, absval:!!f.absval}));
+function filterIsDefault(){
+  return filterState.every((f,i)=> f.lo<=FILTER_DEFS[i].lo && f.hi>=FILTER_DEFS[i].hi);
+}
+function rowInDataset(i, mode){
+  const isSR = DATA.cat[i] === 1;
+  if(mode === "possum") return !isSR;
+  if(mode === "sr") return isSR;
+  if(mode === "both") return !isSR || DATA.srInP[i - DATA.nP] === 0;  // SR only outside POSSUM
+  return true;                                                        // blink: union (full SR)
+}
+function applyFilters(){ // main-thread filter (fast: ~560k x 8 comparisons)
+  const n = DATA.n, cat = DATA.cat;
+  const mode = VIEW.dataset;
+  const act = [];
+  for(let k=0;k<filterState.length;k++){
+    const f = filterState[k], d = FILTER_DEFS[k];
+    if(f.lo > d.lo || f.hi < d.hi) act.push({v:getValues(f.q), lo:f.lo, hi:f.hi, abs:f.absval});
+  }
+  const idx = new Uint32Array(n);
+  let m = 0, mS = 0;
+  outer: for(let i=0;i<n;i++){
+    if(!rowInDataset(i, mode)) continue;
+    for(const a of act){
+      const x = a.abs ? Math.abs(a.v[i]) : a.v[i];
+      if(x < a.lo || x > a.hi) continue outer;
+    }
+    if(cat[i]) mS++;
+    idx[m++] = i;
+  }
+  DATA.filteredIdx = idx.subarray(0, m);
+  DATA.filterCount = m;
+  DATA.filterCountS = mS;
+  DATA.filterCountP = m - mS;
+  return DATA.filteredIdx;
+}
+
+/* ---------- percentiles / histograms ------------------------------ */
+function percentilesOf(arr, idx, ps){
+  const m = idx.length;
+  const step = Math.max(1, Math.floor(m/120000));
+  const s = [];
+  for(let j=0;j<m;j+=step) s.push(arr[idx[j]]);
+  s.sort((a,b)=>a-b);
+  return ps.map(p => s[Math.max(0, Math.min(s.length-1, Math.round(p/100*(s.length-1))))]);
+}
+function cdfRemap(arr, idx, vmin, vmax, N){ // for hist-eq: remap[i] = CDF at v
+  const m = idx.length, step = Math.max(1, Math.floor(m/200000));
+  const s = [];
+  for(let j=0;j<m;j+=step){ const v=arr[idx[j]]; if(v>=vmin && v<=vmax && isFinite(v)) s.push(v); }
+  s.sort((a,b)=>a-b);
+  const out = new Float32Array(N);
+  if(!s.length){ for(let i=0;i<N;i++) out[i]=i/(N-1); return out; }
+  let k = 0;
+  for(let i=0;i<N;i++){
+    const v = vmin + (vmax-vmin)*i/(N-1);
+    while(k < s.length && s[k] <= v) k++;
+    out[i] = k/s.length;
+  }
+  return out;
+}
+
+/* ================================================================
+   Worker: 3-D kd-tree + spherical nearest-neighbour tessellation
+   ================================================================ */
+const WORKER_SRC = `
+"use strict";
+let UX=null, UY=null, UZ=null, N=0;
+let subset=null;            // Uint32Array of source indices in the tree
+let tree=null;              // {idxs: Uint32Array (permuted subset), splits: Float32Array, dims: Uint8Array}
+let medianNN = 0.05;
+
+function buildTree(idx){
+  // in-place kd-tree over unit vectors of subset; nodes stored implicitly
+  const m = idx.length;
+  const perm = new Uint32Array(idx);          // will be permuted
+  const stack = [[0, m]];
+  // iterative median-split using nth_element-style quickselect
+  function quickselect(lo, hi, k, dim){
+    const A = perm;
+    const coord = dim===0?UX:dim===1?UY:UZ;
+    while(hi - lo > 1){
+      const p = coord[A[lo + ((hi-lo)>>1)]];
+      let i = lo, j = hi - 1;
+      while(i <= j){
+        while(coord[A[i]] < p) i++;
+        while(coord[A[j]] > p) j--;
+        if(i <= j){ const t=A[i]; A[i]=A[j]; A[j]=t; i++; j--; }
+      }
+      if(k <= j) hi = j+1; else if(k >= i) lo = i; else return;
+    }
+  }
+  const dims = new Uint8Array(m);
+  while(stack.length){
+    const [lo, hi] = stack.pop();
+    if(hi - lo <= 8) continue;               // leaf
+    // pick widest dim
+    let mn=[1e9,1e9,1e9], mx=[-1e9,-1e9,-1e9];
+    const step = Math.max(1, ((hi-lo)/64)|0);
+    for(let i=lo;i<hi;i+=step){
+      const s = perm[i];
+      const x=UX[s], y=UY[s], z=UZ[s];
+      if(x<mn[0])mn[0]=x; if(x>mx[0])mx[0]=x;
+      if(y<mn[1])mn[1]=y; if(y>mx[1])mx[1]=y;
+      if(z<mn[2])mn[2]=z; if(z>mx[2])mx[2]=z;
+    }
+    let dim=0, w=mx[0]-mn[0];
+    if(mx[1]-mn[1]>w){dim=1;w=mx[1]-mn[1];}
+    if(mx[2]-mn[2]>w){dim=2;}
+    const mid = (lo + hi) >> 1;
+    quickselect(lo, hi, mid, dim);
+    dims[mid] = dim;
+    stack.push([lo, mid], [mid+1, hi]);
+  }
+  return {perm, dims, m};
+}
+
+function nearest(px, py, pz, maxChord2){
+  // returns [subsetPos, dist2] or [-1, inf]
+  const {perm, dims, m} = tree;
+  let best = -1, bd = maxChord2;
+  const stack = [[0, m]];
+  while(stack.length){
+    const fr = stack.pop();
+    let lo = fr[0], hi = fr[1];
+    while(true){
+      if(hi - lo <= 8){
+        for(let i=lo;i<hi;i++){
+          const s = perm[i];
+          const dx=UX[s]-px, dy=UY[s]-py, dz=UZ[s]-pz;
+          const d = dx*dx+dy*dy+dz*dz;
+          if(d < bd){ bd = d; best = i; }
+        }
+        break;
+      }
+      const mid = (lo + hi) >> 1;
+      const s = perm[mid];
+      const dx=UX[s]-px, dy=UY[s]-py, dz=UZ[s]-pz;
+      const d = dx*dx+dy*dy+dz*dz;
+      if(d < bd){ bd = d; best = mid; }
+      const dim = dims[mid];
+      const pc = dim===0?px:dim===1?py:pz;
+      const sc = dim===0?UX[s]:dim===1?UY[s]:UZ[s];
+      const diff = pc - sc;
+      const near = diff < 0 ? [lo, mid] : [mid+1, hi];
+      const far  = diff < 0 ? [mid+1, hi] : [lo, mid];
+      if(diff*diff < bd) stack.push(far);
+      lo = near[0]; hi = near[1];
+      if(lo >= hi) break;
+    }
+  }
+  return [best, bd];
+}
+
+function computeMedianNN(){
+  const m = subset.length;
+  const step = Math.max(1, (m/20000)|0);
+  const ds = [];
+  for(let j=0;j<m;j+=step){
+    const s = subset[j];
+    // query for 2nd nearest: temporarily find nearest excluding self by asking best two
+    const px=UX[s], py=UY[s], pz=UZ[s];
+    // find nearest with dist > tiny epsilon
+    let b1=1e9, b2=1e9;
+    const {perm, dims, m:mm} = tree;
+    const stack=[[0,mm]];
+    while(stack.length){
+      const fr=stack.pop(); let lo=fr[0], hi=fr[1];
+      while(true){
+        if(hi-lo<=8){
+          for(let i=lo;i<hi;i++){
+            const t=perm[i];
+            const dx=UX[t]-px, dy=UY[t]-py, dz=UZ[t]-pz;
+            const d=dx*dx+dy*dy+dz*dz;
+            if(d<b1){b2=b1;b1=d;} else if(d<b2){b2=d;}
+          }
+          break;
+        }
+        const mid=(lo+hi)>>1, t=perm[mid];
+        const dx=UX[t]-px, dy=UY[t]-py, dz=UZ[t]-pz;
+        const d=dx*dx+dy*dy+dz*dz;
+        if(d<b1){b2=b1;b1=d;} else if(d<b2){b2=d;}
+        const dim=dims[mid];
+        const pc=dim===0?px:dim===1?py:pz;
+        const sc=dim===0?UX[t]:dim===1?UY[t]:UZ[t];
+        const diff=pc-sc;
+        const nearR = diff<0?[lo,mid]:[mid+1,hi];
+        const farR  = diff<0?[mid+1,hi]:[lo,mid];
+        if(diff*diff<b2) stack.push(farR);
+        lo=nearR[0]; hi=nearR[1];
+        if(lo>=hi) break;
+      }
+    }
+    ds.push(b2);
+  }
+  ds.sort((a,b)=>a-b);
+  const chord = Math.sqrt(ds[(ds.length/2)|0]);
+  medianNN = 2*Math.asin(Math.min(1, chord/2))*180/Math.PI;
+  return medianNN;
+}
+
+// coarse occupancy grid (0.5 deg) with dilation, for fast blank-sky rejection
+let occ=null; const OCC_RES=0.5, OCC_W=720, OCC_H=360;
+function buildOcc(){
+  occ = new Uint8Array(OCC_W*OCC_H);
+  const m = subset.length;
+  for(let j=0;j<m;j++){
+    const s=subset[j];
+    const lon=Math.atan2(UY[s],UX[s])*180/Math.PI;
+    const lat=Math.asin(Math.max(-1,Math.min(1,UZ[s])))*180/Math.PI;
+    const ix=(((lon+360)%360)/OCC_RES)|0, iy=(((lat+90)/OCC_RES))|0;
+    occ[Math.min(OCC_H-1,iy)*OCC_W + Math.min(OCC_W-1,ix)] = 1;
+  }
+  // dilate x2
+  for(let pass=0;pass<2;pass++){
+    const src = occ.slice();
+    for(let y=0;y<OCC_H;y++)for(let x=0;x<OCC_W;x++){
+      if(src[y*OCC_W+x]) continue;
+      const xm=(x+OCC_W-1)%OCC_W, xp=(x+1)%OCC_W;
+      const ym=Math.max(0,y-1), yp=Math.min(OCC_H-1,y+1);
+      if(src[y*OCC_W+xm]||src[y*OCC_W+xp]||src[ym*OCC_W+x]||src[yp*OCC_W+x]||
+         src[ym*OCC_W+xm]||src[ym*OCC_W+xp]||src[yp*OCC_W+xm]||src[yp*OCC_W+xp]) occ[y*OCC_W+x]=1;
+    }
+  }
+}
+
+function tess(W, H, lon0, lon1, lat0, lat1, maxSepDeg, jobId){
+  // index map over the (possibly wrapping) window; 0xFFFFFFFF = blank
+  const out = new Uint32Array(W*H);
+  out.fill(0xFFFFFFFF);
+  const maxChord = 2*Math.sin(Math.min(180,maxSepDeg)*Math.PI/360);
+  const mc2 = maxChord*maxChord;
+  const dlon = (lon1-lon0)/W, dlat=(lat1-lat0)/H;
+  let filled=0;
+  const t0 = Date.now();
+  for(let y=0;y<H;y++){
+    const lat=(lat0+(y+0.5)*dlat)*Math.PI/180;
+    const cl=Math.cos(lat), sl=Math.sin(lat);
+    const iyO=Math.max(0,Math.min(OCC_H-1,(((lat*180/Math.PI)+90)/OCC_RES)|0));
+    for(let x=0;x<W;x++){
+      const lonD=lon0+(x+0.5)*dlon;
+      const ixO=((((lonD%360)+360)%360)/OCC_RES)|0;
+      if(!occ[iyO*OCC_W+Math.min(OCC_W-1,ixO)]) continue;
+      const lon=lonD*Math.PI/180;
+      const r = nearest(cl*Math.cos(lon), cl*Math.sin(lon), sl, mc2);
+      if(r[0] >= 0){ out[y*W+x] = tree.perm[r[0]]; filled++; }   // perm holds GLOBAL indices
+    }
+    if((y&63)===0 && Date.now()-t0 > 400){
+      postMessage({type:"progress", jobId, frac:y/H});
+    }
+  }
+  return {out, filled};
+}
+
+onmessage = (e) => {
+  const msg = e.data;
+  try{
+    if(msg.type === "init"){
+      UX = msg.ux; UY = msg.uy; UZ = msg.uz; N = UX.length;
+      postMessage({type:"ready"});
+    } else if(msg.type === "subset"){
+      subset = msg.idx;
+      tree = buildTree(subset);
+      const med = computeMedianNN();
+      buildOcc();
+      postMessage({type:"subsetDone", jobId:msg.jobId, n:subset.length, medianNN:med});
+    } else if(msg.type === "tess"){
+      const {W,H,lon0,lon1,lat0,lat1,maxSep,jobId} = msg;
+      const sep = (maxSep==="auto") ? Math.ceil(8*medianNN*100)/100 : +maxSep;
+      const r = tess(W,H,lon0,lon1,lat0,lat1,sep,jobId);
+      postMessage({type:"tessDone", jobId, W,H,lon0,lon1,lat0,lat1,
+                   idxMap:r.out, filled:r.filled, maxSepUsed:sep}, [r.out.buffer]);
+    } else if(msg.type === "nearestPoint"){
+      const v = msg.v;
+      const r = nearest(v[0],v[1],v[2], 4.0);
+      const src = r[0]>=0 ? tree.perm[r[0]] : -1;
+      postMessage({type:"nearestDone", jobId:msg.jobId, src,
+                   sepDeg: r[0]>=0 ? 2*Math.asin(Math.min(1,Math.sqrt(r[1])/2))*180/Math.PI : null});
+    }
+  } catch(err){
+    postMessage({type:"error", jobId:msg.jobId, message:String(err && err.stack || err)});
+  }
+};
+`;
+
+let worker = null;
+const workerJobs = new Map();
+let jobSeq = 0;
+function workerCall(msg, transfer, onProgress){
+  return new Promise((resolve, reject) => {
+    const jobId = ++jobSeq;
+    workerJobs.set(jobId, {resolve, reject, onProgress});
+    worker.postMessage(Object.assign({jobId}, msg), transfer || []);
+  });
+}
+function initWorker(){
+  const blob = new Blob([WORKER_SRC], {type:"application/javascript"});
+  worker = new Worker(URL.createObjectURL(blob));
+  return new Promise((resolve) => {
+    worker.onmessage = (e) => {
+      const m = e.data;
+      if(m.type === "ready"){ resolve(); return; }
+      const job = workerJobs.get(m.jobId);
+      if(!job) return;
+      if(m.type === "progress"){ if(job.onProgress) job.onProgress(m.frac); return; }
+      workerJobs.delete(m.jobId);
+      if(m.type === "error") job.reject(new Error(m.message));
+      else job.resolve(m);
+    };
+    // ship copies of the unit vectors (keep originals on main thread)
+    worker.postMessage({type:"init",
+      ux: DATA.ux.slice(), uy: DATA.uy.slice(), uz: DATA.uz.slice()});
+  });
+}
+</script>

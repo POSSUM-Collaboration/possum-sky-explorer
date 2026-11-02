@@ -1,0 +1,7 @@
+{
+  "_comment": "Copy to build/sources.json (git-ignored) and point at your local inputs.",
+  "possum_polsel_parquet": "/Users/you/Dropbox/Projects/POSSUM_DR1/snapshots/POSSUM_DR1_polsel_SNR6.parquet",
+  "possum_dedup_parquet": "/Users/you/Dropbox/Projects/POSSUM_DR1/DR1_analysis/errorbudget_cache/dedup_cat_ids.parquet",
+  "spiceracs_extract_dir": "/Users/you/Dropbox/Projects/SPICE-RACS_data/claude_sr_extract",
+  "atnf_pulsar_dat": "/Users/you/Dropbox/Projects/POSSUM_DR1/DR1_analysis/ATNF_pulsar_cat_All.dat"
+}

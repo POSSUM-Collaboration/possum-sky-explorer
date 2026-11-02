@@ -1,0 +1,980 @@
+<script>
+"use strict";
+/* ==================================================================
+   Renderer: raycast globe / Mollweide, value textures, bubbles,
+   overlay geometry, labels
+   ================================================================== */
+const VIEW = {
+  proj: "globe",          // globe | mollweide
+  frame: "gal",           // gal | eq  (display frame)
+  dataset: "possum",      // possum | both  (include SPICE-RACS?)
+  catMode: "colour",      // colour | srGray | possumGray
+  tool: "explore",        // explore | region | identify
+  lon0: 285, lat0: -40,   // view centre in display frame, deg
+  zoom: 1.0,              // globe: sphere radius = 0.46*mindim*zoom ; moll: x-unit scale
+  panX: 0, panY: 0,       // mollweide pixel pan
+  theme: "dark",
+  quantity: "rm",
+  mapmode: "tess",
+  cmap: "RdBu_r", cmapFlip: false,
+  stretch: "linear", vmin: -150, vmax: 150, linthresh: 10,
+  gridGal: true, gridEq: false, gridLabels: true,
+  autorefine: true, tessres: 3072, maxsep: "auto",
+  bubbleScale: 9, bubbleAlpha: 0.75,
+};
+
+const THEMES = {
+  dark:  {bg:[.043,.055,.078], sphere:[.085,.10,.135], blank:[.085,.10,.135],
+          gridGal:[.62,.66,.74], gridEq:[.85,.68,.35], ink:"#e8ebf2"},
+  light: {bg:[1,1,1], sphere:[.92,.92,.92], blank:[.92,.92,.92],
+          gridGal:[.45,.45,.45], gridEq:[.75,.55,.2], ink:"#111"},
+};
+
+let gl, canvas, labelCanvas, lctx;
+let progQuad, progPts, progLines;
+let quadVAO;
+let texVal=null, texRefine=null, texLUT=null, texRemap=null;
+let valW=0, valH=0;
+let refineBox=null; // {lon0,lon1,lat0,lat1,W,H} in galactic deg
+let globalIdxMap=null, refineIdxMap=null, refineBoxJS=null;
+let bubbleVAO=null, bubbleIdxBuf=null, bubbleValBuf=null, bubbleCount=0, bubblePosBuf=null;
+const overlayGL = {};   // key -> {ptsVAO, ptsCount, lineVAO, lineCount, color, pcolor}
+
+const VS_QUAD = `#version 300 es
+layout(location=0) in vec2 p;
+void main(){ gl_Position = vec4(p,0.,1.); }`;
+
+const FS_QUAD = `#version 300 es
+precision highp float;
+out vec4 frag;
+uniform vec2 uSize;          // canvas px
+uniform int  uProj;          // 0 globe 1 mollweide
+uniform vec3 uE1,uE2,uE3;    // view basis (display frame)
+uniform float uLon0;         // mollweide centre lon (display frame, deg)
+uniform float uScale;        // globe: px per unit radius; moll: px per x-unit
+uniform vec2 uPan;
+uniform int  uFrame;         // 0 galactic display, 1 equatorial display
+uniform mat3 uGalR;          // v_gal = uGalR * v_eq
+uniform sampler2D uVal;      // full-sky galactic equirect values
+uniform sampler2D uRefine;
+uniform sampler2D uCatT;     // catalogue flag textures (0 POSSUM, 1 SR)
+uniform sampler2D uCatR;
+uniform int  uCatMode;       // 0 colour, 1 SR gray, 2 POSSUM gray
+uniform int  uHasRefine;
+uniform vec4 uRefBox;        // lon0,lon1,lat0,lat1 (galactic deg)
+uniform sampler2D uLUT;
+uniform sampler2D uRemap;
+uniform int  uStretch;       // 0 lin 1 log 2 symlog 3 asinh 4 sqrt 5 histeq
+uniform float uVmin,uVmax,uLinT;
+uniform int  uFlip;
+uniform int  uShowMap;       // draw tessellation?
+uniform vec3 uBg,uSphere,uBlank;
+uniform vec3 uGridGalC,uGridEqC;
+uniform float uGridGal,uGridEq;       // 0/1
+uniform float uGridStep;              // deg
+const float PI=3.14159265358979;
+
+vec3 uvecd(float lon,float lat){
+  float cl=cos(lat);
+  return vec3(cl*cos(lon), cl*sin(lon), sin(lat));
+}
+float stretchT(float v){
+  float t;
+  if(uStretch==1){                       // log
+    float lv = log(max(v,1e-30));
+    t = (lv-log(max(uVmin,1e-30)))/(log(max(uVmax,1e-29))-log(max(uVmin,1e-30)));
+    if(v<=0.) t = 0.;
+  } else if(uStretch==2){                // symlog
+    float lt=max(uLinT,1e-12);
+    float s = sign(v)*log(1.+abs(v)/lt);
+    float s0 = sign(uVmin)*log(1.+abs(uVmin)/lt);
+    float s1 = sign(uVmax)*log(1.+abs(uVmax)/lt);
+    t = (s-s0)/(s1-s0);
+  } else if(uStretch==3){                // asinh
+    float lt=max(uLinT,1e-12);
+    float s = asinh(v/lt), s0=asinh(uVmin/lt), s1=asinh(uVmax/lt);
+    t=(s-s0)/(s1-s0);
+  } else {
+    t=(v-uVmin)/(uVmax-uVmin);
+    if(uStretch==4) t=sqrt(clamp(t,0.,1.));
+    else if(uStretch==5) t=texture(uRemap, vec2(clamp(t,0.,1.),0.5)).r;
+  }
+  return clamp(t,0.,1.);
+}
+vec3 lutColor(float t){
+  if(uFlip==1) t=1.-t;
+  return texture(uLUT, vec2(t*0.99609375+0.001953125, 0.5)).rgb;
+}
+vec2 sampleVal(vec3 vg){   // vg: galactic unit vector -> (value or blank, catFlag)
+  float lon = degrees(atan(vg.y,vg.x)); if(lon<0.) lon+=360.;
+  float lat = degrees(asin(clamp(vg.z,-1.,1.)));
+  if(uHasRefine==1){
+    float rl = mod(lon - uRefBox.x + 720., 360.);
+    float rw = mod(uRefBox.y - uRefBox.x + 720., 360.);
+    if(rw<=0.) rw=360.;
+    if(rl<=rw && lat>=uRefBox.z && lat<=uRefBox.w){
+      vec2 uv = vec2(rl/rw, (lat-uRefBox.z)/(uRefBox.w-uRefBox.z));
+      return vec2(texture(uRefine, uv).r, texture(uCatR, uv).r);
+    }
+  }
+  vec2 uv = vec2(lon/360., (lat+90.)/180.);
+  return vec2(texture(uVal, uv).r, texture(uCatT, uv).r);
+}
+float gridline(float coordDeg, float stepDeg){
+  // distance to nearest multiple of step, in units of screen px
+  float m = abs(fract(coordDeg/stepDeg+0.5)-0.5)*stepDeg;
+  float fw = fwidth(coordDeg);
+  if(fw<=0.0) return 0.;
+  float d = m/fw;
+  return 1.-smoothstep(0.45,1.15,d);
+}
+float graticule(vec3 v){
+  float lon = degrees(atan(v.y,v.x));
+  float lat = degrees(asin(clamp(v.z,-1.,1.)));
+  float lonB = lon<0.?lon+360.:lon;     // second parameterisation
+  float g = max(gridline(lon,uGridStep), gridline(lonB,uGridStep));
+  // suppress meridians very close to the poles (they pile up)
+  g *= smoothstep(89.8,88.5,abs(lat));
+  g = max(g, gridline(lat,uGridStep));
+  return g;
+}
+void main(){
+  vec2 px = gl_FragCoord.xy - 0.5*uSize - uPan;
+  vec3 vdisp; float edge=1.0;
+  if(uProj==0){
+    vec2 q = px/uScale;
+    float r2 = dot(q,q);
+    if(r2>1.0){ frag=vec4(uBg,1.); return; }
+    edge = clamp((1.0-sqrt(r2))*uScale*0.85, 0., 1.);   // AA at the limb
+    float z = sqrt(max(0.,1.-r2));
+    vdisp = normalize(q.x*uE1 + q.y*uE2 + z*uE3);
+  } else {
+    vec2 q = px/uScale;                  // x in [-2sqrt2,2sqrt2]
+    float sq2 = sqrt(2.);
+    float st = q.y/sq2;
+    if(abs(st)>1.){ frag=vec4(uBg,1.); return; }
+    float th = asin(clamp(st,-1.,1.));
+    float lat = asin(clamp((2.*th+sin(2.*th))/PI,-1.,1.));
+    float cth = cos(th);
+    if(cth<1e-4){ frag=vec4(uBg,1.); return; }
+    float dlon = -PI*q.x/(2.*sq2*cth);   // leftward-increasing longitude
+    if(abs(dlon)>PI){ frag=vec4(uBg,1.); return; }
+    float edgeX = (PI - abs(dlon))*2.*sq2*cth*uScale/PI;
+    float edgeY = (1.-abs(st))*sq2*uScale;
+    edge = clamp(min(edgeX,edgeY)*0.7+0.3,0.,1.);
+    vdisp = uvecd(radians(uLon0)+dlon, lat);
+  }
+  // display frame -> galactic for data sampling
+  vec3 vg = (uFrame==1) ? uGalR*vdisp : vdisp;
+  vec3 col = uSphere;
+  if(uShowMap==1){
+    vec2 vc2 = sampleVal(vg);
+    if(vc2.x > -1e29){
+      col = lutColor(stretchT(vc2.x));
+      bool isSR = vc2.y > 0.5;
+      if((uCatMode==1 && isSR) || (uCatMode==2 && !isSR))
+        col = vec3(dot(col, vec3(0.299, 0.587, 0.114)));
+    }
+    else col = uBlank;
+  }
+  // graticules: galactic uses vg; equatorial uses v_eq
+  if(uGridGal>0.5){
+    float g = graticule(vg)*0.55;
+    col = mix(col, uGridGalC, g);
+  }
+  if(uGridEq>0.5){
+    vec3 ve = (uFrame==1) ? vdisp : (vg * uGalR);   // row-vector trick: = GalR^T * vg = v_eq
+    float g = graticule(ve)*0.5;
+    col = mix(col, uGridEqC, g);
+  }
+  col = mix(uBg, col, edge);
+  frag = vec4(col,1.);
+}`;
+
+const VS_PTS = `#version 300 es
+layout(location=0) in vec3 aPos;      // unit vector, galactic
+layout(location=1) in float aVal;
+layout(location=2) in float aCat;     // 0 POSSUM, 1 SR
+uniform vec2 uSize;
+uniform int uProj;
+uniform vec3 uE1,uE2,uE3;
+uniform float uLon0,uScale;
+uniform vec2 uPan;
+uniform int uFrame;
+uniform mat3 uGalRT;                  // v_eq = GalR^T * v_gal (column-major transpose passed in)
+uniform float uPtScale;               // max radius px
+uniform float uVmaxAbs;
+uniform int uSizeMode;                // 1: area ~ |val|; 0: fixed
+out float vVal; out float vClip; out float vSize; out float vCat;
+const float PI=3.14159265358979;
+void main(){
+  vCat = aCat;
+  vec3 vd = (uFrame==1) ? uGalRT*aPos : aPos;
+  vec2 pos; float clip=1.0;
+  if(uProj==0){
+    float x=dot(vd,uE1), y=dot(vd,uE2), z=dot(vd,uE3);
+    if(z<0.02) clip=-1.0;
+    pos = vec2(x,y)*uScale;
+  } else {
+    float lon=atan(vd.y,vd.x), lat=asin(clamp(vd.z,-1.,1.));
+    float dl = lon - radians(uLon0);
+    dl = mod(dl+PI, 2.*PI)-PI;
+    float th=lat;
+    for(int i=0;i<8;i++){
+      float f=2.*th+sin(2.*th)-PI*sin(lat);
+      float fp=2.+2.*cos(2.*th);
+      if(abs(fp)<1e-7) break;
+      th -= f/fp;
+    }
+    float sq2=sqrt(2.);
+    pos = vec2(-2.*sq2/PI*dl*cos(th), sq2*sin(th))*uScale;
+  }
+  vec2 ndc = (pos+uPan)/(0.5*uSize);
+  gl_Position = vec4(ndc, 0., 1.);
+  float s = uPtScale;
+  if(uSizeMode==1){
+    float a = clamp(abs(aVal)/max(uVmaxAbs,1e-9),0.,1.);
+    s = max(1.6, uPtScale*sqrt(a));
+  }
+  gl_PointSize = s*2.0;
+  vVal=aVal; vClip=clip; vSize=s;
+}`;
+
+const FS_PTS = `#version 300 es
+precision highp float;
+in float vVal; in float vClip; in float vSize; in float vCat;
+out vec4 frag;
+uniform int uCatMode;
+uniform sampler2D uLUT;
+uniform sampler2D uRemap;
+uniform int uStretch; uniform float uVmin,uVmax,uLinT; uniform int uFlip;
+uniform int uColorMode;   // 0 lut(t)  1 signed two-colour  2 flat uniform colour
+uniform vec3 uColPos,uColNeg,uColFlat;
+uniform float uAlpha;
+uniform int uRing;        // draw as ring (unfilled)
+float stretchT(float v){
+  float t;
+  if(uStretch==1){ float lv=log(max(v,1e-30));
+    t=(lv-log(max(uVmin,1e-30)))/(log(max(uVmax,1e-29))-log(max(uVmin,1e-30)));
+    if(v<=0.) t=0.;
+  } else if(uStretch==2){ float lt=max(uLinT,1e-12);
+    float s=sign(v)*log(1.+abs(v)/lt), s0=sign(uVmin)*log(1.+abs(uVmin)/lt), s1=sign(uVmax)*log(1.+abs(uVmax)/lt);
+    t=(s-s0)/(s1-s0);
+  } else if(uStretch==3){ float lt=max(uLinT,1e-12);
+    t=(asinh(v/lt)-asinh(uVmin/lt))/(asinh(uVmax/lt)-asinh(uVmin/lt));
+  } else { t=(v-uVmin)/(uVmax-uVmin);
+    if(uStretch==4) t=sqrt(clamp(t,0.,1.));
+    else if(uStretch==5) t=texture(uRemap, vec2(clamp(t,0.,1.),0.5)).r; }
+  return clamp(t,0.,1.);
+}
+void main(){
+  if(vClip<0.) discard;
+  vec2 c = gl_PointCoord*2.-1.;
+  float r = length(c);
+  if(r>1.) discard;
+  float aa = smoothstep(1.0,0.82,r);
+  if(uRing==1){ aa *= smoothstep(0.55,0.72,r); }
+  vec3 col;
+  if(uColorMode==1) col = vVal>=0. ? uColPos : uColNeg;
+  else if(uColorMode==2) col = uColFlat;
+  else { float t=stretchT(vVal); if(uFlip==1)t=1.-t; col=texture(uLUT,vec2(t*0.996+0.002,0.5)).rgb; }
+  if(uColorMode!=2){
+    bool isSR = vCat > 0.5;
+    if((uCatMode==1 && isSR) || (uCatMode==2 && !isSR))
+      col = vec3(dot(col, vec3(0.299, 0.587, 0.114)));
+  }
+  frag = vec4(col, aa*uAlpha);
+}`;
+
+const VS_LINES = `#version 300 es
+layout(location=0) in vec3 aPos;   // unit vec galactic
+uniform vec2 uSize; uniform int uProj;
+uniform vec3 uE1,uE2,uE3; uniform float uLon0,uScale; uniform vec2 uPan;
+uniform int uFrame; uniform mat3 uGalRT;
+out float vClip; out float vMollX;
+const float PI=3.14159265358979;
+void main(){
+  vec3 vd=(uFrame==1)?uGalRT*aPos:aPos;
+  vec2 pos; float clip=1.0; float mx=0.;
+  if(uProj==0){
+    float x=dot(vd,uE1),y=dot(vd,uE2),z=dot(vd,uE3);
+    if(z<0.015) clip=-1.0;
+    pos=vec2(x,y)*uScale;
+  } else {
+    float lon=atan(vd.y,vd.x), lat=asin(clamp(vd.z,-1.,1.));
+    float dl=mod(lon-radians(uLon0)+PI,2.*PI)-PI;
+    float th=lat;
+    for(int i=0;i<8;i++){ float f=2.*th+sin(2.*th)-PI*sin(lat);
+      float fp=2.+2.*cos(2.*th); if(abs(fp)<1e-7)break; th-=f/fp; }
+    float sq2=sqrt(2.);
+    pos=vec2(-2.*sq2/PI*dl*cos(th), sq2*sin(th))*uScale;
+    mx = dl;
+  }
+  vec2 ndc=(pos+uPan)/(0.5*uSize);
+  gl_Position=vec4(ndc,0.,1.);
+  vClip=clip; vMollX=mx;
+}`;
+const FS_LINES = `#version 300 es
+precision highp float;
+in float vClip; in float vMollX;
+out vec4 frag;
+uniform vec3 uColor; uniform float uAlpha;
+void main(){ if(vClip<0.) discard; frag=vec4(uColor,uAlpha); }`;
+
+function compile(vsSrc, fsSrc){
+  function sh(type, src){
+    const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+    if(!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+      throw new Error("shader: "+gl.getShaderInfoLog(s));
+    return s;
+  }
+  const p = gl.createProgram();
+  gl.attachShader(p, sh(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if(!gl.getProgramParameter(p, gl.LINK_STATUS))
+    throw new Error("link: "+gl.getProgramInfoLog(p));
+  return p;
+}
+function U(prog, name){ return gl.getUniformLocation(prog, name); }
+
+function initGL(){
+  canvas = document.getElementById("glcanvas");
+  labelCanvas = document.getElementById("labelcanvas");
+  lctx = labelCanvas.getContext("2d");
+  gl = canvas.getContext("webgl2", {antialias:true, preserveDrawingBuffer:true, alpha:false});
+  if(!gl) throw new Error("WebGL2 is required (any recent Chrome/Firefox/Safari).");
+  gl.getExtension("OES_texture_float_linear");
+  progQuad = compile(VS_QUAD, FS_QUAD);
+  progPts  = compile(VS_PTS, FS_PTS);
+  progLines= compile(VS_LINES, FS_LINES);
+  quadVAO = gl.createVertexArray();
+  gl.bindVertexArray(quadVAO);
+  const qb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, qb);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+
+  texLUT = gl.createTexture(); texRemap = gl.createTexture();
+  uploadRemapIdentity();
+
+  // bubble buffers: static positions for ALL sources
+  bubblePosBuf = gl.createBuffer();
+  const n = DATA.n;
+  const pos = new Float32Array(n*3);
+  for(let i=0;i<n;i++){ pos[3*i]=DATA.ux[i]; pos[3*i+1]=DATA.uy[i]; pos[3*i+2]=DATA.uz[i]; }
+  gl.bindBuffer(gl.ARRAY_BUFFER, bubblePosBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, pos, gl.STATIC_DRAW);
+  bubbleValBuf = gl.createBuffer();
+  bubbleIdxBuf = gl.createBuffer();
+  const catBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, catBuf);
+  const catF = new Float32Array(n);
+  for(let i=0;i<n;i++) catF[i] = DATA.cat[i];
+  gl.bufferData(gl.ARRAY_BUFFER, catF, gl.STATIC_DRAW);
+  bubbleVAO = gl.createVertexArray();
+  gl.bindVertexArray(bubbleVAO);
+  gl.bindBuffer(gl.ARRAY_BUFFER, bubblePosBuf);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,3,gl.FLOAT,false,0,0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, bubbleValBuf);
+  gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1,1,gl.FLOAT,false,0,0);
+  gl.bindBuffer(gl.ARRAY_BUFFER, catBuf);
+  gl.enableVertexAttribArray(2); gl.vertexAttribPointer(2,1,gl.FLOAT,false,0,0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, bubbleIdxBuf);
+  gl.bindVertexArray(null);
+}
+
+function uploadLUT(){
+  let lut = LUTS[VIEW.cmap] || LUTS.viridis;
+  const arr = new Uint8Array(256*4);
+  for(let i=0;i<256;i++){
+    const c = lut[i];
+    arr[4*i]=c[0]; arr[4*i+1]=c[1]; arr[4*i+2]=c[2]; arr[4*i+3]=255;
+  }
+  gl.bindTexture(gl.TEXTURE_2D, texLUT);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,256,1,0,gl.RGBA,gl.UNSIGNED_BYTE,arr);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+}
+function uploadRemapIdentity(){
+  const N=1024, a=new Float32Array(N);
+  for(let i=0;i<N;i++) a[i]=i/(N-1);
+  uploadRemap(a);
+}
+function uploadRemap(arr){
+  gl.bindTexture(gl.TEXTURE_2D, texRemap);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.R32F,arr.length,1,0,gl.RED,gl.FLOAT,arr);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+}
+
+let texCat=null, texCatRefine=null;
+function bakeValueTexture(idxMap, W, H, which){ // which: 'global'|'refine'
+  const vals = getValues(VIEW.quantity);
+  const cat = DATA.cat;
+  const out = new Float32Array(W*H);
+  const cout = new Uint8Array(W*H);
+  for(let i=0;i<W*H;i++){
+    const s = idxMap[i];
+    if(s === 0xFFFFFFFF){ out[i] = -1e30; }
+    else { out[i] = vals[s]; cout[i] = cat[s]*255; }
+  }
+  let tex = which === "global" ? texVal : texRefine;
+  if(!tex){ tex = gl.createTexture(); if(which==="global") texVal=tex; else texRefine=tex; }
+  const wrapS = which==="global" ? gl.REPEAT : gl.CLAMP_TO_EDGE;
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.R32F,W,H,0,gl.RED,gl.FLOAT,out);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S, wrapS);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  let ctex = which === "global" ? texCat : texCatRefine;
+  if(!ctex){ ctex = gl.createTexture(); if(which==="global") texCat=ctex; else texCatRefine=ctex; }
+  gl.bindTexture(gl.TEXTURE_2D, ctex);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.R8,W,H,0,gl.RED,gl.UNSIGNED_BYTE,cout);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S, wrapS);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  if(which==="global"){ valW=W; valH=H; }
+}
+function rebakeAll(){                 // after quantity change
+  if(VIEW.dataset === "blink" && typeof BLINK !== "undefined" && BLINK.mapA){
+    bakeBlinkArrays(); blinkApplyPhase(); uploadBubbleValues(); return;
+  }
+  if(globalIdxMap) bakeValueTexture(globalIdxMap, valW, valH, "global");
+  if(refineIdxMap && refineBoxJS) bakeValueTexture(refineIdxMap, refineBoxJS.W, refineBoxJS.H, "refine");
+  uploadBubbleValues();
+}
+function uploadBakedGlobal(W, H, valArr, catArr){
+  if(!texVal) texVal = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, texVal);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.R32F,W,H,0,gl.RED,gl.FLOAT,valArr);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  if(!texCat) texCat = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, texCat);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.R8,W,H,0,gl.RED,gl.UNSIGNED_BYTE,catArr);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  valW = W; valH = H;
+}
+function uploadBubbleValues(){
+  const vals = getValues(VIEW.quantity);
+  gl.bindBuffer(gl.ARRAY_BUFFER, bubbleValBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, vals, gl.STATIC_DRAW);
+}
+let filterGen = 0;   // bumped on every filter change (used to invalidate refine tex)
+function uploadBubbleIndexFrom(idx){
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, bubbleIdxBuf);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+  bubbleCount = idx.length;
+}
+function uploadBubbleIndex(){ uploadBubbleIndexFrom(DATA.filteredIdx); }
+
+/* ---------- view maths (JS mirror of shader) ---------------------- */
+function viewBasis(){
+  const lat = Math.max(-89.95, Math.min(89.95, VIEW.lat0));
+  const vc = uvec(VIEW.lon0, lat);
+  // e1 = vc x zhat (normalised) -> longitude increases to the LEFT
+  let e1 = [vc[1], -vc[0], 0];
+  const n1 = Math.hypot(e1[0], e1[1]) || 1;
+  e1 = [e1[0]/n1, e1[1]/n1, 0];
+  const e3 = vc;
+  const e2 = [e1[1]*e3[2]-e1[2]*e3[1], e1[2]*e3[0]-e1[0]*e3[2], e1[0]*e3[1]-e1[1]*e3[0]]; // e1 x e3 = north
+  return {e1, e2, e3};
+}
+function globeScale(){
+  const md = Math.min(canvas.clientWidth, canvas.clientHeight);
+  return 0.462*md*VIEW.zoom;
+}
+function mollScale(){
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  return Math.min(w/(4*Math.SQRT2*1.06), h/(2*Math.SQRT2*1.10))*VIEW.zoom;
+}
+// display-frame vector for a data (galactic) lon/lat
+function galToDisplay(l, b){
+  if(VIEW.frame === "gal") return uvec(l, b);
+  const [ra, dec] = galToEq(l, b);
+  return uvec(ra, dec);
+}
+function project(l, b){   // galactic coords -> screen px (or null). Returns [x,y,front]
+  const vd = galToDisplay(l, b);
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if(VIEW.proj === "globe"){
+    const {e1,e2,e3} = viewBasis();
+    const x = vd[0]*e1[0]+vd[1]*e1[1]+vd[2]*e1[2];
+    const y = vd[0]*e2[0]+vd[1]*e2[1]+vd[2]*e2[2];
+    const z = vd[0]*e3[0]+vd[1]*e3[1]+vd[2]*e3[2];
+    const s = globeScale();
+    return [w/2 + x*s + VIEW.panX, h/2 - (y*s) + VIEW.panY, z];
+  } else {
+    const lon = Math.atan2(vd[1], vd[0]), lat = Math.asin(Math.max(-1,Math.min(1,vd[2])));
+    let dl = lon - VIEW.lon0*D2R;
+    dl = ((dl + Math.PI) % (2*Math.PI) + 2*Math.PI) % (2*Math.PI) - Math.PI;
+    let th = lat;
+    for(let i=0;i<10;i++){
+      const f = 2*th + Math.sin(2*th) - Math.PI*Math.sin(lat);
+      const fp = 2 + 2*Math.cos(2*th);
+      if(Math.abs(fp) < 1e-8) break;
+      th -= f/fp;
+    }
+    const s = mollScale();
+    const x = -2*Math.SQRT2/Math.PI*dl*Math.cos(th)*s;
+    const y = Math.SQRT2*Math.sin(th)*s;
+    return [w/2 + x + VIEW.panX, h/2 - y + VIEW.panY, 1];
+  }
+}
+function unproject(px, py){  // screen px -> [l, b] galactic, or null
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  const X = px - w/2 - VIEW.panX, Y = (h/2 - py) + VIEW.panY;
+  let vd;
+  if(VIEW.proj === "globe"){
+    const s = globeScale();
+    const qx = X/s, qy = Y/s;
+    const r2 = qx*qx + qy*qy;
+    if(r2 > 1) return null;
+    const z = Math.sqrt(1-r2);
+    const {e1,e2,e3} = viewBasis();
+    vd = [qx*e1[0]+qy*e2[0]+z*e3[0], qx*e1[1]+qy*e2[1]+z*e3[1], qx*e1[2]+qy*e2[2]+z*e3[2]];
+  } else {
+    const s = mollScale();
+    const qx = X/s, qy = Y/s;
+    const st = qy/Math.SQRT2;
+    if(Math.abs(st) > 1) return null;
+    const th = Math.asin(st);
+    const lat = Math.asin(Math.max(-1, Math.min(1, (2*th + Math.sin(2*th))/Math.PI)));
+    const cth = Math.cos(th);
+    if(cth < 1e-4) return null;
+    const dl = -Math.PI*qx/(2*Math.SQRT2*cth);
+    if(Math.abs(dl) > Math.PI) return null;
+    vd = uvec(VIEW.lon0 + dl*R2D, lat*R2D);
+  }
+  let vg = (VIEW.frame === "eq") ? matvec(GAL_R, vd) : vd;
+  return lonlat(vg);
+}
+
+/* ---------- render ------------------------------------------------ */
+let needRender = true;
+function requestRender(){ needRender = true; }
+
+function gridStepForZoom(){
+  const z = VIEW.zoom;
+  if(z < 1.6) return 30;
+  if(z < 3.5) return 15;
+  if(z < 8) return 5;
+  if(z < 20) return 2;
+  if(z < 45) return 1;
+  return 0.5;
+}
+
+function setCommonUniforms(prog){
+  const {e1,e2,e3} = viewBasis();
+  const dpr = devicePixelRatio_;
+  gl.uniform2f(U(prog,"uSize"), canvas.width, canvas.height);
+  gl.uniform1i(U(prog,"uProj"), VIEW.proj === "globe" ? 0 : 1);
+  gl.uniform3f(U(prog,"uE1"), e1[0],e1[1],e1[2]);
+  gl.uniform3f(U(prog,"uE2"), e2[0],e2[1],e2[2]);
+  gl.uniform3f(U(prog,"uE3"), e3[0],e3[1],e3[2]);
+  gl.uniform1f(U(prog,"uLon0"), VIEW.lon0);
+  gl.uniform1f(U(prog,"uScale"), (VIEW.proj==="globe" ? globeScale() : mollScale())*dpr);
+  gl.uniform2f(U(prog,"uPan"), VIEW.panX*dpr, -VIEW.panY*dpr);
+  gl.uniform1i(U(prog,"uFrame"), VIEW.frame === "eq" ? 1 : 0);
+}
+function setStretchUniforms(prog){
+  const S = {linear:0, log:1, symlog:2, asinh:3, sqrt:4, histeq:5};
+  gl.uniform1i(U(prog,"uStretch"), S[VIEW.stretch] ?? 0);
+  gl.uniform1f(U(prog,"uVmin"), VIEW.vmin);
+  gl.uniform1f(U(prog,"uVmax"), VIEW.vmax);
+  gl.uniform1f(U(prog,"uLinT"), VIEW.linthresh);
+  gl.uniform1i(U(prog,"uFlip"), VIEW.cmapFlip ? 1 : 0);
+}
+
+let devicePixelRatio_ = 1;
+function resize(){
+  devicePixelRatio_ = Math.min(2, window.devicePixelRatio || 1);
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = Math.round(w*devicePixelRatio_);
+  canvas.height = Math.round(h*devicePixelRatio_);
+  labelCanvas.width = canvas.width; labelCanvas.height = canvas.height;
+  requestRender();
+}
+
+function render(){
+  const th = THEMES[VIEW.theme];
+  gl.viewport(0,0,canvas.width,canvas.height);
+  gl.clearColor(th.bg[0],th.bg[1],th.bg[2],1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.disable(gl.DEPTH_TEST);
+
+  // ---- pass 1: globe/mollweide surface with tessellation ----
+  gl.useProgram(progQuad);
+  setCommonUniforms(progQuad);
+  setStretchUniforms(progQuad);
+  // column-major mat3 for GAL_R (rows given) -> supply columns
+  gl.uniformMatrix3fv(U(progQuad,"uGalR"), false, new Float32Array([
+    GAL_R[0],GAL_R[3],GAL_R[6], GAL_R[1],GAL_R[4],GAL_R[7], GAL_R[2],GAL_R[5],GAL_R[8]]));
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, texVal);
+  gl.uniform1i(U(progQuad,"uVal"), 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, texRefine || texVal);
+  gl.uniform1i(U(progQuad,"uRefine"), 1);
+  const hasRef = !!(texRefine && refineBoxJS &&
+      refineBoxJS.quantity === VIEW.quantity && refineBoxJS.filterGen === filterGen);
+  gl.uniform1i(U(progQuad,"uHasRefine"), hasRef ? 1 : 0);
+  if(refineBoxJS) gl.uniform4f(U(progQuad,"uRefBox"),
+      refineBoxJS.lon0, refineBoxJS.lon1, refineBoxJS.lat0, refineBoxJS.lat1);
+  else gl.uniform4f(U(progQuad,"uRefBox"), 0,0,0,0);
+  gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, texLUT);
+  gl.uniform1i(U(progQuad,"uLUT"), 2);
+  gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, texRemap);
+  gl.uniform1i(U(progQuad,"uRemap"), 3);
+  gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, texCat || texVal);
+  gl.uniform1i(U(progQuad,"uCatT"), 4);
+  gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, texCatRefine || texCat || texVal);
+  gl.uniform1i(U(progQuad,"uCatR"), 5);
+  gl.uniform1i(U(progQuad,"uCatMode"),
+      VIEW.catMode === "srGray" ? 1 : VIEW.catMode === "possumGray" ? 2 : 0);
+  gl.uniform1i(U(progQuad,"uShowMap"), (VIEW.mapmode==="tess"||VIEW.mapmode==="both") && texVal ? 1 : 0);
+  gl.uniform3fv(U(progQuad,"uBg"), th.bg);
+  gl.uniform3fv(U(progQuad,"uSphere"), th.sphere);
+  gl.uniform3fv(U(progQuad,"uBlank"), th.blank);
+  gl.uniform3fv(U(progQuad,"uGridGalC"), th.gridGal);
+  gl.uniform3fv(U(progQuad,"uGridEqC"), th.gridEq);
+  gl.uniform1f(U(progQuad,"uGridGal"), VIEW.gridGal?1:0);
+  gl.uniform1f(U(progQuad,"uGridEq"), VIEW.gridEq?1:0);
+  gl.uniform1f(U(progQuad,"uGridStep"), gridStepForZoom());
+  gl.bindVertexArray(quadVAO);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.bindVertexArray(null);
+
+  const galRT = new Float32Array([   // columns of GalR^T = rows of GalR
+    GAL_R[0],GAL_R[1],GAL_R[2], GAL_R[3],GAL_R[4],GAL_R[5], GAL_R[6],GAL_R[7],GAL_R[8]]);
+
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+  // ---- pass 2: bubbles ----
+  if((VIEW.mapmode==="bubble"||VIEW.mapmode==="both") && bubbleCount>0){
+    gl.useProgram(progPts);
+    setCommonUniforms(progPts);
+    setStretchUniforms(progPts);
+    gl.uniformMatrix3fv(U(progPts,"uGalRT"), false, galRT);
+    gl.activeTexture(gl.TEXTURE2); gl.bindTexture(gl.TEXTURE_2D, texLUT);
+    gl.uniform1i(U(progPts,"uLUT"), 2);
+    gl.activeTexture(gl.TEXTURE3); gl.bindTexture(gl.TEXTURE_2D, texRemap);
+    gl.uniform1i(U(progPts,"uRemap"), 3);
+    const isRM = VIEW.quantity === "rm";
+    gl.uniform1f(U(progPts,"uPtScale"), VIEW.bubbleScale*Math.sqrt(Math.max(0.3,VIEW.zoom))*devicePixelRatio_);
+    gl.uniform1f(U(progPts,"uVmaxAbs"), Math.max(Math.abs(VIEW.vmin), Math.abs(VIEW.vmax)));
+    gl.uniform1i(U(progPts,"uSizeMode"), isRM ? 1 : 0);
+    gl.uniform1i(U(progPts,"uColorMode"), isRM ? 1 : 0);
+    gl.uniform3f(U(progPts,"uColPos"), 0.82,0.20,0.16);
+    gl.uniform3f(U(progPts,"uColNeg"), 0.19,0.39,0.80);
+    gl.uniform3f(U(progPts,"uColFlat"), 1,1,1);
+    gl.uniform1f(U(progPts,"uAlpha"), VIEW.bubbleAlpha);
+    gl.uniform1i(U(progPts,"uRing"), 0);
+    gl.uniform1i(U(progPts,"uCatMode"),
+        VIEW.catMode === "srGray" ? 1 : VIEW.catMode === "possumGray" ? 2 : 0);
+    gl.bindVertexArray(bubbleVAO);
+    gl.drawElements(gl.POINTS, bubbleCount, gl.UNSIGNED_INT, 0);
+    gl.bindVertexArray(null);
+  }
+
+  // ---- pass 3: overlays ----
+  for(const key of Object.keys(overlayGL)){
+    const og = overlayGL[key];
+    if(!og.enabled) continue;
+    if(og.lineCount > 0){
+      gl.useProgram(progLines);
+      setCommonUniforms(progLines);
+      gl.uniformMatrix3fv(U(progLines,"uGalRT"), false, galRT);
+      gl.uniform3fv(U(progLines,"uColor"), og.color);
+      gl.uniform1f(U(progLines,"uAlpha"), 0.75);
+      gl.bindVertexArray(og.lineVAO);
+      gl.drawArrays(gl.LINES, 0, og.lineCount);
+      gl.bindVertexArray(null);
+      if(og.line2Count > 0){
+        gl.uniform1f(U(progLines,"uAlpha"), 0.32);
+        gl.bindVertexArray(og.line2VAO);
+        gl.drawArrays(gl.LINES, 0, og.line2Count);
+        gl.bindVertexArray(null);
+      }
+    }
+    if(og.ptsCount > 0){
+      gl.useProgram(progPts);
+      setCommonUniforms(progPts);
+      setStretchUniforms(progPts);
+      gl.uniformMatrix3fv(U(progPts,"uGalRT"), false, galRT);
+      gl.uniform1f(U(progPts,"uPtScale"), (og.ptSize || 4.5)*devicePixelRatio_);
+      gl.uniform1i(U(progPts,"uSizeMode"), 0);
+      gl.uniform1i(U(progPts,"uColorMode"), 2);
+      gl.uniform3fv(U(progPts,"uColFlat"), og.color);
+      gl.uniform1f(U(progPts,"uAlpha"), og.alpha || 0.9);
+      gl.uniform1i(U(progPts,"uRing"), og.ring ? 1 : 0);
+      gl.uniform1i(U(progPts,"uCatMode"), 0);
+      gl.bindVertexArray(og.ptsVAO);
+      gl.drawArrays(gl.POINTS, 0, og.ptsCount);
+      gl.bindVertexArray(null);
+    }
+  }
+  gl.disable(gl.BLEND);
+
+  drawLabels();
+  drawGratLabels();
+  drawRegionCircle();
+  updateRegionMarker();
+}
+
+/* ---------- region circle (2-D label-canvas overlay) ---------------- */
+const REGION = {active:false, dragging:false, l:0, b:0, radius:0, idx:null, sep:null};
+function buildRegionGeometry(){ /* geometry is drawn per-frame in drawRegionCircle */ }
+function drawRegionCircle(){
+  if(!(REGION.active || REGION.dragging)) return;
+  const ctx = lctx;
+  ctx.save();
+  ctx.scale(devicePixelRatio_, devicePixelRatio_);
+  // circle: small circle of angular radius around centre, projected point-by-point
+  const c = uvec(REGION.l, REGION.b);
+  let a = Math.abs(c[2]) < 0.9 ? [0,0,1] : [1,0,0];
+  let u = [c[1]*a[2]-c[2]*a[1], c[2]*a[0]-c[0]*a[2], c[0]*a[1]-c[1]*a[0]];
+  const nu = Math.hypot(u[0],u[1],u[2]); u = [u[0]/nu, u[1]/nu, u[2]/nu];
+  const w = [c[1]*u[2]-c[2]*u[1], c[2]*u[0]-c[0]*u[2], c[0]*u[1]-c[1]*u[0]];
+  const rr = Math.max(0.02, REGION.radius);
+  const cr = Math.cos(rr*D2R), sr = Math.sin(rr*D2R);
+  const SEG = 240;
+  ctx.strokeStyle = "#38ff6e";
+  ctx.lineWidth = 2;
+  ctx.shadowColor = "rgba(0,0,0,0.9)";
+  ctx.shadowBlur = 3;
+  ctx.beginPath();
+  let pen = false;
+  for(let s = 0; s <= SEG; s++){
+    const ph = 2*Math.PI*s/SEG;
+    const x = cr*c[0] + sr*(Math.cos(ph)*u[0] + Math.sin(ph)*w[0]);
+    const y = cr*c[1] + sr*(Math.cos(ph)*u[1] + Math.sin(ph)*w[1]);
+    const z = cr*c[2] + sr*(Math.cos(ph)*u[2] + Math.sin(ph)*w[2]);
+    const ll = lonlat([x, y, z]);
+    const p = project(ll[0], ll[1]);
+    if(!p || p[2] < 0.01){ pen = false; continue; }
+    if(!pen){ ctx.moveTo(p[0], p[1]); pen = true; }
+    else ctx.lineTo(p[0], p[1]);
+  }
+  ctx.stroke();
+  // centre x
+  const pc = project(REGION.l, REGION.b);
+  if(pc && pc[2] > 0.01){
+    ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.moveTo(pc[0]-5, pc[1]-5); ctx.lineTo(pc[0]+5, pc[1]+5);
+    ctx.moveTo(pc[0]-5, pc[1]+5); ctx.lineTo(pc[0]+5, pc[1]-5);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+function updateRegionMarker(){
+  const el = document.getElementById("regionbadge");
+  if(!el) return;
+  if(!(REGION.active || REGION.dragging)){ el.style.display = "none"; return; }
+  const p = project(REGION.l, REGION.b);
+  if(!p || p[2] < 0.03){ el.style.display = "none"; return; }
+  el.style.display = "block";
+  el.style.left = p[0] + "px";
+  el.style.top = (p[1] - 14) + "px";
+  el.textContent = REGION.radius.toFixed(REGION.radius < 1 ? 2 : 1) + "°";
+}
+
+/* ---------- label layer ------------------------------------------- */
+const labelPool = [];
+function getLabelDiv(i){
+  let d = labelPool[i];
+  if(!d){
+    d = document.createElement("div");
+    d.className = "skylabel";
+    document.getElementById("labels").appendChild(d);
+    labelPool[i] = d;
+  }
+  d.style.display = "block";
+  return d;
+}
+function hideLabelsFrom(i){
+  for(let j=i;j<labelPool.length;j++) labelPool[j].style.display = "none";
+}
+function drawLabels(){
+  let li = 0;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  const occupied = [];
+  function collides(x, y){
+    for(const q of occupied)
+      if(Math.abs(q[0]-x) < 78 && Math.abs(q[1]-y) < 17) return true;
+    return false;
+  }
+  for(const key of Object.keys(overlayGL)){
+    const og = overlayGL[key];
+    if(!og.enabled || !og.labels || !og.showLabels) continue;
+    let placed = 0;
+    for(const lb of og.labels){
+      if(placed >= og.maxLabels) break;
+      const p = project(lb.l, lb.b);
+      if(!p || p[2] < 0.05) continue;
+      if(p[0] < -30 || p[0] > w+30 || p[1] < -10 || p[1] > h+10) continue;
+      if(collides(p[0], p[1])) continue;
+      occupied.push(p);
+      const d = getLabelDiv(li++);
+      d.innerHTML = lb.html;
+      d.className = "skylabel" + (lb.dim ? " dim" : "");
+      d.style.left = p[0]+"px";
+      d.style.top = p[1]+"px";
+      d.style.color = og.labelColor || "#ffe9c4";
+      placed++;
+    }
+  }
+  hideLabelsFrom(li);
+}
+function drawGratLabels(){
+  lctx.clearRect(0,0,labelCanvas.width,labelCanvas.height);
+  if(!VIEW.gridLabels) return;
+  const th = THEMES[VIEW.theme];
+  lctx.save();
+  lctx.scale(devicePixelRatio_, devicePixelRatio_);
+  lctx.font = "10.5px ui-monospace, Menlo, monospace";
+  lctx.textAlign = "center";
+  const step = gridStepForZoom();
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  const drawn = [];
+  function tryLabel(Ldisp, Bdisp, text, colour){
+    // Ldisp/Bdisp in DISPLAY frame -> convert to galactic for project()
+    let gl_, gb_;
+    if(VIEW.frame === "eq"){ [gl_, gb_] = eqToGal(Ldisp, Bdisp); }
+    else { gl_ = Ldisp; gb_ = Bdisp; }
+    const p = project(gl_, gb_);
+    if(!p || p[2] < 0.12) return;
+    if(p[0] < 18 || p[0] > w-18 || p[1] < 26 || p[1] > h-30) return;
+    for(const q of drawn) if(Math.abs(q[0]-p[0])<34 && Math.abs(q[1]-p[1])<14) return;
+    drawn.push(p);
+    lctx.fillStyle = colour;
+    lctx.globalAlpha = 0.85;
+    lctx.fillText(text, p[0], p[1]-3);
+    lctx.globalAlpha = 1;
+  }
+  // label meridians along view-centre parallel, parallels along view-centre meridian
+  const ink = VIEW.theme === "light" ? "#555" : "#aeb6c6";
+  const c = [VIEW.lon0, VIEW.lat0];    // display frame
+  const labstep = (VIEW.zoom < 1.6 && VIEW.proj !== "globe") ? step*2 : step;
+  for(let L=0; L<360-1e-6; L+=labstep){
+    const txt = (VIEW.frame==="eq") ? (L%15===0 && step>=15 ? (L/15)+"ʰ" : L.toFixed(step<1?1:0)+"°") : L.toFixed(step<1?1:0)+"°";
+    tryLabel(L, c[1], txt, ink);
+  }
+  for(let B=-90+labstep; B<90-1e-6; B+=labstep){
+    tryLabel(c[0], B, (B>0?"+":"")+B.toFixed(step<1?1:0)+"°", ink);
+  }
+  lctx.restore();
+}
+
+/* ---------- overlay geometry builders ------------------------------ */
+function buildOverlayGeometry(key, rows, spec){
+  // rows: filtered rows. spec.kind: points | circles | labels
+  let og = overlayGL[key];
+  if(!og){ og = overlayGL[key] = {enabled:false}; }
+  const fields = spec.fields;
+  const iL = fields.indexOf("l"), iB = fields.indexOf("b");
+  // points
+  const pts = new Float32Array(rows.length*3);
+  for(let i=0;i<rows.length;i++){
+    const v = uvec(rows[i][iL], rows[i][iB]);
+    pts[3*i]=v[0]; pts[3*i+1]=v[1]; pts[3*i+2]=v[2];
+  }
+  if(!og.ptsBuf) og.ptsBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, og.ptsBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, pts, gl.STATIC_DRAW);
+  if(!og.ptsVAO){
+    og.ptsVAO = gl.createVertexArray();
+    gl.bindVertexArray(og.ptsVAO);
+    gl.bindBuffer(gl.ARRAY_BUFFER, og.ptsBuf);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,3,gl.FLOAT,false,0,0);
+    gl.disableVertexAttribArray(1); gl.vertexAttrib1f(1, 0);
+    gl.bindVertexArray(null);
+  }
+  og.ptsCount = spec.kind === "circles" ? 0 : rows.length;
+
+  // circles for cluster-like overlays (largest first, so the size cap keeps the big ones)
+  if(spec.kind === "circles"){
+    const iR = fields.indexOf(spec.radiusField);
+    const MAXC = 6000, SEG = 40;
+    const bySize = rows.slice().sort((a, b) => (b[iR] || 0) - (a[iR] || 0));
+    const nC = Math.min(bySize.length, MAXC);
+    const v1 = new Float32Array(nC*SEG*2*3);
+    const v2 = spec.radius2Factor ? new Float32Array(nC*SEG*2*3) : null;
+    let o1=0, o2=0;
+    for(let i=0;i<nC;i++){
+      const l = bySize[i][iL], b = bySize[i][iB];
+      const rr = Math.max(0.03, bySize[i][iR] || 0.03);
+      o1 = appendCircle(v1, o1, l, b, rr, SEG);
+      if(v2) o2 = appendCircle(v2, o2, l, b, rr*spec.radius2Factor, SEG);
+    }
+    if(!og.lineBuf) og.lineBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, og.lineBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, v1.subarray(0,o1), gl.STATIC_DRAW);
+    if(!og.lineVAO){
+      og.lineVAO = gl.createVertexArray();
+      gl.bindVertexArray(og.lineVAO);
+      gl.bindBuffer(gl.ARRAY_BUFFER, og.lineBuf);
+      gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,3,gl.FLOAT,false,0,0);
+      gl.bindVertexArray(null);
+    }
+    og.lineCount = o1/3;
+    if(v2){
+      if(!og.line2Buf) og.line2Buf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, og.line2Buf);
+      gl.bufferData(gl.ARRAY_BUFFER, v2.subarray(0,o2), gl.STATIC_DRAW);
+      if(!og.line2VAO){
+        og.line2VAO = gl.createVertexArray();
+        gl.bindVertexArray(og.line2VAO);
+        gl.bindBuffer(gl.ARRAY_BUFFER, og.line2Buf);
+        gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,3,gl.FLOAT,false,0,0);
+        gl.bindVertexArray(null);
+      }
+      og.line2Count = o2/3;
+    } else og.line2Count = 0;
+    og.ptsCount = rows.length;   // small centre dots too
+    og.ptSize = 2.2; og.alpha = 0.8;
+  } else og.lineCount = 0;
+  return og;
+}
+function appendCircle(arr, off, l, b, radDeg, SEG){
+  // small circle of angular radius radDeg around (l,b), as SEG line segments
+  const c = uvec(l, b);
+  // basis perpendicular to c
+  let a = Math.abs(c[2]) < 0.9 ? [0,0,1] : [1,0,0];
+  let u = [c[1]*a[2]-c[2]*a[1], c[2]*a[0]-c[0]*a[2], c[0]*a[1]-c[1]*a[0]];
+  const nu = Math.hypot(u[0],u[1],u[2]); u=[u[0]/nu,u[1]/nu,u[2]/nu];
+  const w = [c[1]*u[2]-c[2]*u[1], c[2]*u[0]-c[0]*u[2], c[0]*u[1]-c[1]*u[0]];
+  const cr = Math.cos(radDeg*D2R), sr = Math.sin(radDeg*D2R);
+  let px=0, py=0, pz=0;
+  for(let s=0;s<=SEG;s++){
+    const ph = 2*Math.PI*s/SEG;
+    const x = cr*c[0] + sr*(Math.cos(ph)*u[0] + Math.sin(ph)*w[0]);
+    const y = cr*c[1] + sr*(Math.cos(ph)*u[1] + Math.sin(ph)*w[1]);
+    const z = cr*c[2] + sr*(Math.cos(ph)*u[2] + Math.sin(ph)*w[2]);
+    if(s>0){
+      arr[off++]=px; arr[off++]=py; arr[off++]=pz;
+      arr[off++]=x;  arr[off++]=y;  arr[off++]=z;
+    }
+    px=x; py=y; pz=z;
+  }
+  return off;
+}
+</script>

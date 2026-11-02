@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>POSSUM Sky Explorer</title>
+<link rel="icon" href="data:,">
+<style>
+:root{
+  --bg:#0b0e14; --panel:#12161f; --panel2:#181d29; --edge:#242b3a;
+  --ink:#e8ebf2; --ink2:#9aa3b5; --muted:#6b7488;
+  --acc:#4f8cff; --acc2:#7aa5f5; --warn:#e0a33b; --pos:#e0362c; --neg:#3b6fd4;
+  --radius:10px; --mono:ui-monospace,'SF Mono',Menlo,Consolas,monospace;
+  --sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+}
+*{box-sizing:border-box; margin:0; padding:0}
+html,body{width:100%;height:100%;overflow:hidden;background:var(--bg);color:var(--ink);
+  font-family:var(--sans);font-size:13px}
+#app{display:flex;width:100%;height:100%}
+
+/* ---------------- sidebar ---------------- */
+#sidebar{width:308px;min-width:308px;height:100%;overflow-y:auto;overflow-x:hidden;
+  background:var(--panel);border-right:1px solid var(--edge);display:flex;flex-direction:column;
+  scrollbar-width:thin;scrollbar-color:var(--edge) transparent;z-index:20}
+#sidebar.collapsed{display:none}
+#brand{padding:14px 16px 10px;border-bottom:1px solid var(--edge)}
+#brand h1{font-size:16px;font-weight:650;letter-spacing:.2px}
+#brand h1 span{color:var(--acc2)}
+#brand .sub{color:var(--ink2);font-size:11px;margin-top:3px;line-height:1.45}
+.section{border-bottom:1px solid var(--edge)}
+.sec-head{display:flex;align-items:center;justify-content:space-between;padding:9px 16px;
+  cursor:pointer;user-select:none;font-weight:600;font-size:12px;letter-spacing:.4px;
+  text-transform:uppercase;color:var(--ink2)}
+.sec-head:hover{color:var(--ink)}
+.sec-head .chev{transition:transform .15s;font-size:10px}
+.section.open .sec-head .chev{transform:rotate(90deg)}
+.sec-body{display:none;padding:2px 16px 14px}
+.section.open .sec-body{display:block}
+.row{display:flex;align-items:center;gap:8px;margin:7px 0}
+.row label{color:var(--ink2);flex:0 0 auto}
+.row .grow{flex:1}
+select,input[type=text],input[type=number],input[type=search]{
+  background:var(--panel2);color:var(--ink);border:1px solid var(--edge);
+  border-radius:6px;padding:5px 8px;font-size:12px;width:100%;outline:none;font-family:var(--sans)}
+select:focus,input:focus{border-color:var(--acc)}
+input[type=number]{width:74px;font-family:var(--mono);font-size:11px}
+button{background:var(--panel2);color:var(--ink);border:1px solid var(--edge);
+  border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer;font-family:var(--sans)}
+button:hover{border-color:var(--acc);color:#fff}
+button.primary{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}
+button.primary:hover{background:var(--acc2)}
+button.mini{padding:2px 7px;font-size:11px;color:var(--ink2)}
+button.mini:hover{color:#fff}
+.btnrow{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0 2px}
+.check{display:flex;align-items:center;gap:8px;margin:6px 0;cursor:pointer;color:var(--ink)}
+.check input{accent-color:var(--acc);width:14px;height:14px;cursor:pointer}
+.check .sw{width:10px;height:10px;border-radius:3px;flex:0 0 auto}
+.check small{color:var(--muted);margin-left:auto;font-family:var(--mono);font-size:10px}
+.hint{color:var(--muted);font-size:11px;line-height:1.5;margin:6px 0}
+.kv{display:flex;justify-content:space-between;font-size:11px;color:var(--ink2);margin:2px 0}
+.kv b{color:var(--ink);font-family:var(--mono);font-weight:500}
+
+/* dual sliders */
+.dsl{margin:10px 0 2px}
+.dsl .lab{display:flex;justify-content:space-between;font-size:11px;color:var(--ink2);margin-bottom:3px}
+.dsl .lab .val{font-family:var(--mono);color:var(--ink);font-size:10.5px}
+.dsl .track{position:relative;height:22px}
+.dsl input[type=range]{position:absolute;left:0;top:0;width:100%;height:22px;-webkit-appearance:none;
+  appearance:none;background:transparent;pointer-events:none;margin:0}
+.dsl input[type=range]::-webkit-slider-runnable-track{height:4px;background:transparent}
+.dsl input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;pointer-events:auto;
+  width:13px;height:13px;border-radius:50%;background:var(--acc);border:2px solid #fff2;
+  margin-top:-4.5px;cursor:ew-resize}
+.dsl input[type=range]::-moz-range-thumb{pointer-events:auto;width:11px;height:11px;border-radius:50%;
+  background:var(--acc);border:2px solid #fff2;cursor:ew-resize}
+.dsl .rail{position:absolute;top:9px;left:0;right:0;height:4px;border-radius:2px;background:var(--edge)}
+.dsl .fill{position:absolute;top:9px;height:4px;border-radius:2px;background:var(--acc)}
+
+/* overlay entries */
+.ov{border:1px solid var(--edge);border-radius:8px;margin:8px 0;background:var(--panel2)}
+.ov-head{display:flex;align-items:center;gap:8px;padding:7px 10px;cursor:pointer}
+.ov-head input{accent-color:var(--acc)}
+.ov-head .name{flex:1;font-weight:550;font-size:12px}
+.ov-head .n{font-family:var(--mono);font-size:10px;color:var(--muted)}
+.ov-body{display:none;padding:2px 12px 10px;border-top:1px solid var(--edge)}
+.ov.open .ov-body{display:block}
+.ov .desc{color:var(--muted);font-size:10.5px;line-height:1.45;margin:5px 0}
+
+/* ---------------- main stage ---------------- */
+#stage{position:relative;flex:1;height:100%;min-width:0;background:var(--bg)}
+#glcanvas,#labelcanvas{position:absolute;inset:0;width:100%;height:100%}
+#labelcanvas{pointer-events:none}
+#labels{position:absolute;inset:0;pointer-events:none;overflow:hidden}
+.skylabel{position:absolute;transform:translate(-50%,-130%);font-size:11px;color:#fffdE8;
+  text-shadow:0 0 4px #000,0 0 2px #000,0 1px 3px #000;white-space:nowrap;pointer-events:none;
+  font-weight:550;letter-spacing:.2px}
+.skylabel.dim{opacity:.75;font-weight:400}
+.skylabel .tp{opacity:.7;font-size:9.5px}
+
+/* top bar */
+#topbar{position:absolute;top:0;left:0;right:0;display:flex;align-items:center;gap:8px;
+  padding:10px 14px;pointer-events:none;z-index:30}
+#topbar>*{pointer-events:auto}
+#burger{font-size:15px;padding:4px 10px}
+#search{position:relative;width:290px}
+#search input{padding:6px 10px 6px 28px;border-radius:8px;background:#12161fd9;backdrop-filter:blur(6px)}
+#search .ic{position:absolute;left:9px;top:6px;color:var(--muted);font-size:12px}
+#searchres{position:absolute;top:32px;left:0;right:0;background:var(--panel);border:1px solid var(--edge);
+  border-radius:8px;max-height:280px;overflow-y:auto;display:none;box-shadow:0 8px 30px #0009}
+#searchres .sr{padding:6px 10px;cursor:pointer;display:flex;justify-content:space-between;gap:8px;font-size:12px}
+#searchres .sr:hover{background:var(--panel2)}
+#searchres .sr small{color:var(--muted)}
+#viewinfo{margin-left:auto;display:flex;gap:6px}
+.pill{background:#12161fd9;border:1px solid var(--edge);border-radius:8px;padding:5px 10px;
+  font-size:11px;color:var(--ink2);backdrop-filter:blur(6px)}
+.pill b{color:var(--ink);font-family:var(--mono);font-weight:500}
+
+/* status bar */
+#status{position:absolute;left:0;right:0;bottom:0;display:flex;align-items:center;gap:14px;
+  padding:6px 14px;font-family:var(--mono);font-size:11px;color:var(--ink2);
+  background:linear-gradient(transparent,#0b0e14cc 40%);pointer-events:none;z-index:9}
+#status b{color:var(--ink);font-weight:500}
+#progress{position:absolute;left:50%;top:14px;transform:translateX(-50%);
+  background:#12161fee;border:1px solid var(--edge);border-radius:8px;padding:7px 16px;
+  font-size:12px;color:var(--ink);display:none;z-index:30;box-shadow:0 8px 30px #0009}
+#progress .bar{height:3px;border-radius:2px;background:var(--edge);margin-top:6px;overflow:hidden}
+#progress .bar>div{height:100%;background:var(--acc);width:0%;transition:width .2s}
+
+/* colorbar */
+#cbarwrap{position:absolute;left:50%;bottom:26px;transform:translateX(-50%);
+  text-align:center;pointer-events:none;z-index:8}
+#cbar{border-radius:4px}
+#cbartitle{font-size:12px;color:var(--ink);margin-top:2px;text-shadow:0 1px 3px #000}
+
+/* inspect card */
+#inspect{position:absolute;background:var(--panel);border:1px solid var(--edge);border-radius:10px;
+  min-width:250px;max-width:310px;box-shadow:0 12px 40px #000a;display:none;z-index:40;font-size:12px}
+#inspect .hd{display:flex;align-items:center;justify-content:space-between;padding:8px 12px;
+  border-bottom:1px solid var(--edge);font-weight:600}
+#inspect .hd .x{cursor:pointer;color:var(--muted);padding:0 4px}
+#inspect .hd .x:hover{color:#fff}
+#inspect .bd{padding:8px 12px;max-height:320px;overflow-y:auto}
+#inspect .kv b{font-size:11px}
+#inspect .foot{padding:7px 12px;border-top:1px solid var(--edge);display:flex;gap:6px}
+
+/* tooltip */
+#tip{position:absolute;background:#12161ff0;border:1px solid var(--edge);border-radius:7px;
+  padding:6px 9px;font-size:11px;pointer-events:none;display:none;z-index:35;max-width:260px;
+  box-shadow:0 6px 20px #0008;line-height:1.5}
+#tip b{color:var(--acc2)}
+
+/* modal (import mapping / help) */
+#modalback{position:fixed;inset:0;background:#0008;display:none;z-index:90;
+  align-items:center;justify-content:center}
+#modal{background:var(--panel);border:1px solid var(--edge);border-radius:12px;width:520px;
+  max-width:92vw;max-height:86vh;overflow-y:auto;box-shadow:0 20px 80px #000c}
+#modal .hd{padding:12px 16px;border-bottom:1px solid var(--edge);font-weight:650;font-size:14px}
+#modal .bd{padding:12px 16px}
+#modal .ft{padding:12px 16px;border-top:1px solid var(--edge);display:flex;justify-content:flex-end;gap:8px}
+#modal table{width:100%;border-collapse:collapse;font-size:12px}
+#modal td,#modal th{padding:4px 6px;text-align:left;border-bottom:1px solid var(--edge)}
+#modal .bd h4{margin:10px 0 4px;font-size:12.5px}
+#modal .bd p,#modal .bd li{color:var(--ink2);font-size:12px;line-height:1.6}
+#modal .bd ul{padding-left:18px;margin:4px 0}
+#modal .bd kbd{background:var(--panel2);border:1px solid var(--edge);border-radius:4px;
+  padding:0 5px;font-family:var(--mono);font-size:10.5px}
+
+/* light map background mode keeps UI dark; only canvas bg changes */
+.dragging{cursor:grabbing !important}
+#glcanvas{cursor:grab}
+a{color:var(--acc2);text-decoration:none}
+a:hover{text-decoration:underline}
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-thumb{background:var(--edge);border-radius:5px}
+::-webkit-scrollbar-track{background:transparent}
+#fatal{position:fixed;inset:0;display:none;align-items:center;justify-content:center;z-index:99;
+  background:var(--bg);color:var(--ink);text-align:center;padding:30px;line-height:1.7}
+
+/* tool + tab bars */
+#toolbar{display:flex;gap:2px;background:#12161fd9;border:1px solid var(--edge);
+  border-radius:8px;padding:2px;backdrop-filter:blur(6px)}
+#toolbar button{border:none;background:transparent;padding:5px 11px;border-radius:6px;color:var(--ink2)}
+#toolbar button.active{background:var(--acc);color:#fff;font-weight:600}
+#toolbar button:hover:not(.active){color:#fff}
+#tabbar{display:flex;gap:2px;background:#12161fd9;border:1px solid var(--edge);
+  border-radius:8px;padding:2px;backdrop-filter:blur(6px)}
+#tabbar button{border:none;background:transparent;padding:5px 13px;border-radius:6px;color:var(--ink2)}
+#tabbar button.active{background:var(--panel2);color:#fff;font-weight:600}
+#tabbar button .dot{display:inline-block;width:7px;height:7px;border-radius:50%;
+  background:#38ff6e;margin-left:6px;vertical-align:1px}
+#regionbadge{position:absolute;transform:translate(-50%,-100%);display:none;pointer-events:none;
+  font:600 11px var(--mono);color:#38ff6e;text-shadow:0 0 4px #000,0 1px 3px #000;z-index:11}
+#blinklabel{position:absolute;top:54px;left:50%;transform:translateX(-50%);display:none;
+  pointer-events:none;z-index:12;font:700 15px var(--sans);letter-spacing:2px;
+  text-shadow:0 0 6px #000,0 1px 3px #000;text-transform:uppercase}
+#cutcanvas{width:100%;aspect-ratio:3.2/1;height:auto;display:block;border-radius:8px;background:#0d1017}
+#profcanvas{width:100%;height:340px;display:block}
+.chips{display:flex;gap:14px;flex-wrap:wrap;margin:4px 0 8px}
+.chips label{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--ink2);cursor:pointer}
+.chips .csw{width:14px;height:3px;border-radius:2px}
+.ctlrow{display:flex;gap:22px;flex-wrap:wrap;align-items:flex-end;margin-bottom:6px}
+.ctlrow .dsl{flex:1;min-width:180px;max-width:280px;margin:0}
+.region-hint{position:absolute;top:56px;left:50%;transform:translateX(-50%);z-index:10;
+  background:#0d331add;border:1px solid #38ff6e55;color:#b7ffce;border-radius:8px;
+  padding:6px 14px;font-size:12px;display:none;pointer-events:none}
+
+/* region analysis tab */
+#regiontab{position:absolute;inset:0;display:none;overflow-y:auto;background:var(--bg);z-index:15;
+  padding:58px 26px 30px}
+#regiontab h2{font-size:16px;margin-bottom:4px}
+#regiontab .sub{color:var(--ink2);font-size:12px;margin-bottom:16px}
+.statgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin:14px 0}
+.stat{background:var(--panel);border:1px solid var(--edge);border-radius:10px;padding:10px 13px}
+.stat .k{color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.4px}
+.stat .v{font-family:var(--mono);font-size:17px;margin-top:3px;color:var(--ink)}
+.stat .u{color:var(--ink2);font-size:10px}
+.rt-section{background:var(--panel);border:1px solid var(--edge);border-radius:12px;
+  padding:14px 16px;margin:14px 0}
+.rt-section h3{font-size:13px;margin-bottom:10px;color:var(--ink2);text-transform:uppercase;
+  letter-spacing:.4px;font-weight:600}
+#histcanvas{width:100%;height:300px;display:block}
+#regtable{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:10.5px}
+#regtable th{color:var(--ink2);text-align:right;padding:4px 8px;border-bottom:1px solid var(--edge);
+  position:sticky;top:0;background:var(--panel)}
+#regtable td{text-align:right;padding:3px 8px;border-bottom:1px solid #1a2030;color:var(--ink)}
+#regtable th:first-child,#regtable td:first-child{text-align:left}
+#regtablewrap{max-height:320px;overflow-y:auto;border:1px solid var(--edge);border-radius:8px}
+.identify-row{display:flex;justify-content:space-between;gap:10px;padding:5px 0;
+  border-bottom:1px solid #1a2030;font-size:12px;cursor:pointer}
+.identify-row:hover{background:var(--panel2)}
+.identify-row .t{color:var(--muted);font-size:10.5px}
+.identify-row .s{font-family:var(--mono);color:var(--acc2);white-space:nowrap}
+</style>
+</head>
+<body>
+<div id="fatal"></div>
+<div id="app">
+  <div id="sidebar">
+    <div id="brand">
+      <h1>POSSUM <span>DR1</span> Sky Explorer <span style="font-size:10px;color:var(--muted);font-weight:500">v3</span></h1>
+      <div class="sub">Polarisation Sky Survey of the Universe's Magnetism<br>
+      <span id="brandcount">&nbsp;</span></div>
+    </div>
+
+    <div class="section open" id="sec-data">
+      <div class="sec-head">Datasets <span class="chev">&#9654;</span></div>
+      <div class="sec-body">
+        <div class="row"><label style="width:62px">Include</label>
+          <select id="dataset" class="grow">
+            <option value="possum">POSSUM DR1 only</option>
+            <option value="both">POSSUM + SPICE-RACS (where POSSUM absent)</option>
+            <option value="sr">SPICE-RACS DR2 only (full)</option>
+            <option value="blink">Blink: POSSUM &harr; SPICE-RACS</option>
+          </select></div>
+        <div class="row" id="catmoderow" style="display:none"><label style="width:62px">Render</label>
+          <select id="catmode" class="grow">
+            <option value="colour">Both in colour</option>
+            <option value="srGray">SPICE-RACS in greyscale</option>
+            <option value="possumGray">POSSUM in greyscale</option>
+          </select></div>
+        <div id="blinkctl" style="display:none">
+          <div class="dsl" id="blinkspeed-slider"></div>
+          <div class="btnrow"><button class="mini" id="blinkpause">Pause</button>
+            <button class="mini" id="blinkstep">Step</button></div>
+        </div>
+        <div class="kv"><span>POSSUM / SPICE-RACS shown</span><b id="catcounts">&ndash;</b></div>
+        <div class="hint" id="srhint" style="display:none">In combined mode, SPICE-RACS DR2
+          components are shown only on sky &gt;0.4&deg; from every POSSUM component, so each
+          Voronoi cell belongs to exactly one survey. Blink mode compares the full catalogues
+          over the whole sky. Click any cell to see its source catalogue.</div>
+      </div>
+    </div>
+
+    <div class="section open" id="sec-map">
+      <div class="sec-head">Map <span class="chev">&#9654;</span></div>
+      <div class="sec-body">
+        <div class="row"><label style="width:62px">Quantity</label>
+          <select id="quantity" class="grow"></select></div>
+        <div class="row"><label style="width:62px">Style</label>
+          <select id="mapmode" class="grow">
+            <option value="tess">Voronoi tessellation (nearest neighbour)</option>
+            <option value="bubble">RM bubble plot (classic)</option>
+            <option value="both">Tessellation + bubbles</option>
+          </select></div>
+        <div class="row"><label style="width:62px">Projection</label>
+          <select id="projection" class="grow">
+            <option value="globe">Globe (orthographic)</option>
+            <option value="mollweide">Mollweide (all sky)</option>
+          </select></div>
+        <div class="row"><label style="width:62px">Frame</label>
+          <select id="frame" class="grow">
+            <option value="gal">Galactic (l, b)</option>
+            <option value="eq">Equatorial (RA, Dec)</option>
+          </select></div>
+        <div class="row"><label style="width:62px">Theme</label>
+          <select id="bgtheme" class="grow">
+            <option value="dark">Dark sky</option>
+            <option value="light">Light (paper style)</option>
+          </select></div>
+        <div class="btnrow">
+          <button class="mini" id="preset-rm">RM (paper)</button>
+          <button class="mini" id="preset-polint">Pol. int.</button>
+          <button class="mini" id="preset-fracpol">Frac. pol.</button>
+          <button class="mini" id="preset-polang">B-angle</button>
+          <button class="mini" id="btn-reset">Reset view</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="section open" id="sec-colour">
+      <div class="sec-head">Colour scale <span class="chev">&#9654;</span></div>
+      <div class="sec-body">
+        <div class="row"><label style="width:62px">Colormap</label>
+          <select id="cmap" class="grow"></select>
+          <button class="mini" id="cmapflip" title="reverse colormap">&#8646;</button></div>
+        <div class="row"><label style="width:62px">Stretch</label>
+          <select id="stretch" class="grow">
+            <option value="linear">Linear</option>
+            <option value="log">Log</option>
+            <option value="symlog">Symmetric log</option>
+            <option value="asinh">Asinh</option>
+            <option value="sqrt">Square root</option>
+            <option value="histeq">Histogram equalise</option>
+          </select></div>
+        <div class="row" id="linthreshrow" style="display:none"><label style="width:62px">Lin. thresh</label>
+          <input type="number" id="linthresh" value="10" step="any"></div>
+        <div class="dsl" id="vrange-slider"></div>
+        <div class="row"><label>Min</label><input type="number" id="vmin" step="any">
+          <label>Max</label><input type="number" id="vmax" step="any"></div>
+        <div class="btnrow">
+          <button class="mini" data-pct="1,99">1&ndash;99%</button>
+          <button class="mini" data-pct="2,98">2&ndash;98%</button>
+          <button class="mini" data-pct="0.5,99.5">0.5&ndash;99.5%</button>
+          <button class="mini" data-pct="0,100">min&ndash;max</button>
+          <button class="mini" id="symzero" title="centre the scale on zero">&plusmn;sym</button>
+        </div>
+        <div id="bubbleopts" style="display:none">
+          <div class="dsl" id="bubblesize-slider"></div>
+          <div class="dsl" id="bubblealpha-slider"></div>
+          <div class="hint">Bubble area &prop; |RM| up to the colour-scale max; red = RM &gt; 0, blue = RM &lt; 0 (only for RM; other quantities use the colormap).</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="section open" id="sec-grid">
+      <div class="sec-head">Grids &amp; rendering <span class="chev">&#9654;</span></div>
+      <div class="sec-body">
+        <label class="check"><input type="checkbox" id="grid-gal" checked> Galactic graticule</label>
+        <label class="check"><input type="checkbox" id="grid-eq"> Equatorial graticule</label>
+        <label class="check"><input type="checkbox" id="grid-labels" checked> Graticule labels</label>
+        <label class="check"><input type="checkbox" id="autorefine" checked> Auto-refine tessellation on zoom</label>
+        <div class="row"><label class="grow">Base resolution</label>
+          <select id="tessres" style="width:130px">
+            <option value="2048">2048 &times; 1024</option>
+            <option value="3072" selected>3072 &times; 1536</option>
+            <option value="4096">4096 &times; 2048</option>
+          </select></div>
+        <div class="row"><label class="grow">Max cell size</label>
+          <select id="maxsep" style="width:130px">
+            <option value="auto" selected>auto (8&times; median)</option>
+            <option value="0.2">0.2&deg;</option><option value="0.5">0.5&deg;</option>
+            <option value="1">1&deg;</option><option value="2">2&deg;</option>
+            <option value="180">unlimited</option>
+          </select></div>
+      </div>
+    </div>
+
+    <div class="section" id="sec-filters">
+      <div class="sec-head">Source filters <span class="chev">&#9654;</span></div>
+      <div class="sec-body">
+        <div class="kv"><span>passing / total</span><b id="filtercount">&ndash;</b></div>
+        <div id="filtersliders"></div>
+        <div class="btnrow"><button class="mini" id="filterreset">Reset filters</button></div>
+        <div class="hint">Filters re-select the components and rebuild the tessellation &mdash; the map is always the Voronoi diagram of exactly the plotted sample.</div>
+      </div>
+    </div>
+
+    <div class="section" id="sec-overlays">
+      <div class="sec-head">Overlays <span class="chev">&#9654;</span></div>
+      <div class="sec-body" id="overlaylist"></div>
+    </div>
+
+    <div class="section" id="sec-import">
+      <div class="sec-head">Import catalogue <span class="chev">&#9654;</span></div>
+      <div class="sec-body">
+        <div class="hint">Load your own catalogue as CSV/TSV (e.g. a 6dFGS or eROSITA export). Needs columns for position (RA/Dec or l/b, degrees); numeric columns become filter sliders.</div>
+        <div class="btnrow">
+          <button id="importbtn" class="primary">Choose file&hellip;</button>
+          <input type="file" id="importfile" accept=".csv,.tsv,.txt" style="display:none">
+        </div>
+      </div>
+    </div>
+
+    <div class="section" id="sec-export">
+      <div class="sec-head">Export <span class="chev">&#9654;</span></div>
+      <div class="sec-body">
+        <div class="row"><label class="grow">Image scale</label>
+          <select id="exportscale" style="width:100px">
+            <option value="1">1&times;</option><option value="2" selected>2&times;</option>
+            <option value="3">3&times;</option></select></div>
+        <div class="btnrow">
+          <button id="exp-png" class="primary">PNG</button>
+          <button id="exp-pdf">PDF</button>
+          <button id="exp-csv">CSV of selection</button>
+        </div>
+        <div class="hint">PNG/PDF capture the current view with graticules, overlays, labels and colour bar. CSV writes the filtered component list (up to 400k rows).</div>
+      </div>
+    </div>
+
+    <div class="section" id="sec-about">
+      <div class="sec-head">About <span class="chev">&#9654;</span></div>
+      <div class="sec-body" id="aboutbody"></div>
+    </div>
+  </div>
+
+  <div id="stage">
+    <canvas id="glcanvas"></canvas>
+    <canvas id="labelcanvas"></canvas>
+    <div id="labels"></div>
+    <div id="topbar">
+      <button id="burger" title="toggle panel">&#9776;</button>
+      <div id="tabbar">
+        <button id="tab-explorer" class="active">Explorer</button>
+        <button id="tab-region">Region analysis<span class="dot" style="display:none"></span></button>
+      </div>
+      <div id="toolbar" title="pointer tool">
+        <button id="tool-explore" class="active" title="Explore: drag rotates, click inspects">Explore</button>
+        <button id="tool-region" title="Region: click centre, drag out a circle (max 20&deg;)">&#9678; Region</button>
+        <button id="tool-identify" title="Identify: click to list known objects near a position">&#9737; Identify</button>
+      </div>
+      <div id="search"><span class="ic">&#128269;</span>
+        <input type="search" id="searchbox" placeholder="Search object / go to l b or RA Dec &hellip;" autocomplete="off">
+        <div id="searchres"></div>
+      </div>
+      <div id="viewinfo">
+        <div class="pill" id="pill-n"><b>&ndash;</b> components</div>
+        <div class="pill" id="pill-view">&nbsp;</div>
+      </div>
+    </div>
+    <div class="region-hint" id="regionhint">Click the region centre, hold, and drag outward &mdash; release to fix the radius (max 20&deg;)</div>
+    <div id="blinklabel"></div>
+    <div id="regionbadge"></div>
+    <div id="regiontab"></div>
+    <div id="cbarwrap"><canvas id="cbar" width="460" height="42"></canvas><div id="cbartitle"></div></div>
+    <div id="status">
+      <span id="st-coord">&nbsp;</span><span id="st-val">&nbsp;</span><span id="st-src">&nbsp;</span>
+      <span style="margin-left:auto" id="st-help">drag rotate &middot; wheel zoom &middot; click inspect &middot; ? help</span>
+    </div>
+    <div id="progress"><span id="progresstext">Working&hellip;</span><div class="bar"><div id="progressbar"></div></div></div>
+    <div id="inspect"></div>
+    <div id="tip"></div>
+  </div>
+</div>
+<div id="modalback"><div id="modal"></div></div>

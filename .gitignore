@@ -1,0 +1,18 @@
+# --- proprietary / generated data never enters the repo ---
+data/*
+!data/README.md
+dist/
+dist-*/
+build/sources.json
+build/overlay_sources/*.fits
+build/__pycache__/
+*.b64
+*.bin.gz
+*.parquet
+
+# --- tooling ---
+node_modules/
+package-lock.json
+.DS_Store
+*.png
+!docs/*.png

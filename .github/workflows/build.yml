@@ -1,0 +1,42 @@
+name: build-and-test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  demo-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install numpy scipy astropy matplotlib cmasher
+      - name: Synthetic demo data package
+        run: python3 build/make_demo_data.py --out data/demo
+      - name: Assemble hosted + embedded builds
+        run: |
+          python3 build/assemble.py --data data/demo --out dist-demo
+          python3 build/assemble.py --data data/demo --out dist-demo --mode embed
+      - name: Syntax-check the assembled page
+        run: |
+          python3 - <<'EOF'
+          import re, subprocess, sys
+          html = open('dist-demo/index.html').read()
+          for i, b in enumerate(re.findall(r'<script>(.*?)</script>', html, re.S)):
+              open(f'/tmp/blk{i}.js', 'w').write(b)
+              subprocess.run(['node', '--check', f'/tmp/blk{i}.js'], check=True)
+          print('syntax ok')
+          EOF
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - run: npm install playwright && npx playwright install --with-deps chromium
+      - name: Smoke test (hosted build over http)
+        run: |
+          (cd dist-demo && python3 -m http.server 8000 >/dev/null 2>&1 &)
+          sleep 1
+          node tests/smoke.js http://localhost:8000/index.html
+      - uses: actions/upload-artifact@v4
+        with:
+          name: demo-build
+          path: dist-demo

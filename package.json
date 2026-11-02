@@ -1,0 +1,11 @@
+{
+  "name": "possum-sky-explorer",
+  "private": true,
+  "description": "Interactive all-sky viewer for the POSSUM rotation-measure grid",
+  "scripts": {
+    "demo": "python3 build/make_demo_data.py --out data/demo && python3 build/assemble.py --data data/demo --out dist-demo",
+    "serve-demo": "cd dist-demo && python3 -m http.server 8000",
+    "test": "node tests/smoke.js http://localhost:8000/index.html"
+  },
+  "devDependencies": { "playwright": "^1.45.0" }
+}
