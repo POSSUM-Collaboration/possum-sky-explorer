@@ -19,6 +19,11 @@ discovery work.
 * Overlays with virial-radius circles; import your own CSV catalogue at runtime.
 * No server, no database, no framework: one HTML page (raw WebGL2) plus data files.
 
+> **New to git, or just want to know what to click next?** Read
+> [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md) — it walks from the zip on your
+> disk to a public GitHub repo and a members-only deployment on the wiki, using GitHub
+> Desktop (no command line).
+
 **Code is public; data is not (yet).** This repository contains the viewer and its
 build tools only. Catalogue data is a separate, versioned *data package* that the
 page fetches at run time from wherever you host it (`config.json` says where). During
@@ -51,7 +56,7 @@ The hosted build must be served over http(s) — browsers refuse `fetch()` from
    (`index.html`, `config.json`, `data/2026-11/…`), and/or
    `python3 build/assemble.py --data data/2026-11 --mode embed` → one 17 MB file.
 
-See `docs/DEPLOYMENT.md` for wiki/web hosting, access control during the
+See `docs/GETTING_STARTED.md` for the step-by-step first-time path, `docs/DEPLOYMENT.md` for wiki/web hosting, access control during the
 proprietary period, and the rolling-release routine, and `docs/BUILD_KIT_README.md`
 for data-format details.
 
@@ -64,7 +69,7 @@ src/        part1_skeleton.html  (markup + CSS)      part3_render.html (WebGL, p
 build/      assemble.py          build_payload.py    make_demo_data.py  make_luts.py
             famous_objects.py    sources.example.json  overlay_sources/  sr_extract/
 tests/      smoke.js             (boots a URL, filter regression, region check)
-docs/       DEPLOYMENT.md        BUILD_KIT_README.md
+docs/       GETTING_STARTED.md   DEPLOYMENT.md        BUILD_KIT_README.md
 data/       (git-ignored) data packages
 ```
 
